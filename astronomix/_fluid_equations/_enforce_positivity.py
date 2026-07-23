@@ -16,6 +16,7 @@ from jaxtyping import Array, Float
 # jax
 import jax
 import jax.numpy as jnp
+from astronomix._stencil_operations._stencil_operations import custom_roll
 
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
@@ -252,7 +253,13 @@ def _redistribute_positivity_native(
     def sum_neighbors(arr):
         out = jnp.zeros_like(arr)
         for shift in itertools.product((-1, 0, 1), repeat=ndim):
-            out = out + jnp.roll(arr, shift=shift, axis=axes)
+            # Compose the multi-axis roll one axis at a time through ``custom_roll``
+            # so the shift crosses device-slab boundaries on the sharded axis
+            # (a plain multi-axis ``jnp.roll`` would wrap locally under sharding).
+            rolled = arr
+            for axis, axis_shift in zip(axes, shift):
+                rolled = custom_roll(rolled, axis_shift, axis)
+            out = out + rolled
         return out
 
     rho_sum = sum_neighbors(rho * valid_f)
@@ -374,12 +381,12 @@ def _conservative_energy_positivity(
         for _ in range(config.positivity_config.cons_passes):
             transfer = jnp.zeros_like(corrected)
             for ax in range(config.dimensionality):
-                nbr = jnp.roll(corrected, shift=-1, axis=ax)   # cell i+1 at index i
+                nbr = custom_roll(corrected, -1, ax)   # cell i+1 at index i
                 active = (jnp.minimum(corrected, nbr) < activate).astype(
                     corrected.dtype
                 )
                 f = w * active * (corrected - nbr)             # flux i -> i+1
-                transfer = transfer + jnp.roll(f, shift=1, axis=ax) - f
+                transfer = transfer + custom_roll(f, 1, ax) - f
             corrected = corrected + transfer
 
         # conservative correction: shift total energy by the redistribution

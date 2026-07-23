@@ -44,6 +44,15 @@ class ChemistryConfig(NamedTuple):
             rate-modifier vectors).
         solver: Stiff-solver tag (see the module-level constants).
         max_steps: Maximum internal Diffrax steps per cell per hydro step.
+        reaction_chunk_size: When positive and smaller than the number of grid
+            cells, react the grid in sequential chunks of this many cells
+            (``jax.lax.map`` with this ``batch_size``) instead of a single
+            ``vmap`` over the whole grid. Each chunk is still vmapped internally,
+            so throughput is preserved once a chunk saturates the device, but the
+            stiff-solver working set is bounded to one chunk rather than the whole
+            grid. The per-cell solves are independent, so the result is identical
+            to the unchunked path; this only bounds peak memory. Zero (the
+            default) reacts the whole grid at once (original behaviour).
         thermochemistry: When True, the temperature is evolved together with the
             abundances (heating/cooling feedback) and written back into the
             pressure field. When False the species react at a fixed temperature
@@ -69,6 +78,7 @@ class ChemistryConfig(NamedTuple):
     number_of_reactions: int = 0
     solver: int = KVAERNO5
     max_steps: int = 4096
+    reaction_chunk_size: int = 0
 
     # thermochemistry (chemistry-driven heating/cooling of the energy field)
     thermochemistry: bool = False
@@ -143,6 +153,14 @@ class ChemistryParams(NamedTuple):
     floor_temperature: float = 1e1
     # H + H -> H2 grain formation rate coefficient [cm^3 s^-1] (formation heating)
     hydrogen_molecule_formation_rate_coefficient: float = 3e-17
+
+    # Cooling limiter: the maximum fractional change in temperature the
+    # operator-split thermochemistry may apply to a cell in one hydro step
+    # (``|dT|/T <= cooling_courant``). Bounds the pressure change the fixed-grid
+    # hydro sees per step, stabilising the coupling to stiff radiative cooling
+    # while keeping the timestep at the fast hydro CFL. A cell needing more
+    # cooling converges over the next few steps.
+    cooling_courant: float = 0.3
 
     # stiff-solver tolerances
     atol: float = 1e-18

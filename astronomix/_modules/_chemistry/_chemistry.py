@@ -138,9 +138,24 @@ def _advance_single_cell(
     # imports without it when chemistry is inactive.
     import diffrax as dx
 
+    # Diffrax's implicit solve goes through Lineax, whose structural check is
+    # sharding-strict on jax 0.10 and would otherwise block the solve under any
+    # mesh; make it sharding-agnostic so the chemistry can run multi-GPU.
+    from ._sharding_compat import ensure_lineax_sharding_compatibility
+
+    ensure_lineax_sharding_compatibility()
+
     # The chemistry right-hand side; the physical parameters shared across cells
     # are closed over rather than threaded through Diffrax ``args``.
     def chemistry_derivative(time, abundances, temperature_kelvin):
+        # The stiff solver probes intermediate states that can transiently
+        # overshoot to negative abundances or a non-physical temperature; clamp
+        # both before the network evaluates its rate products (T enters the
+        # Arrhenius/temperature-dependent rates), so a pathological cell cannot
+        # emit NaNs/infs that would poison the whole vmapped solve. Physical
+        # states are untouched.
+        abundances = jnp.maximum(abundances, 0.0)
+        temperature_kelvin = jnp.clip(temperature_kelvin, 3.0, 1.0e9)
         return reaction_network(
             time,
             abundances,
@@ -215,8 +230,18 @@ def _advance_single_cell(
         max_steps=max_steps,
     )
 
-    # Only the end state matters for an operator-split sub-step.
-    return solution.ys[-1]
+    # Only the end state matters for an operator-split sub-step. Guard against a
+    # cell whose stiff solve did not converge (e.g. hit ``max_steps`` on a
+    # pathological, strongly-compressed cell): Diffrax then returns a non-success
+    # result and its final value can be non-finite. Rather than let one such cell
+    # poison the whole vmapped grid with a NaN, keep that cell's pre-reaction
+    # state for this operator-split sub-step (it reacts again next step). The
+    # element-wise finite check is a final backstop.
+    final_state = solution.ys[-1]
+    solve_succeeded = solution.result == dx.RESULTS.successful
+    final_state = jnp.where(solve_succeeded, final_state, initial_state)
+    final_state = jnp.where(jnp.isfinite(final_state), final_state, initial_state)
+    return final_state
 
 
 @partial(jax.jit, static_argnames=("chemistry_config", "registered_variables"))
@@ -263,6 +288,9 @@ def update_chemistry(
     if chemistry_config.solver == KVAERNO5:
         import diffrax as dx
 
+        from ._sharding_compat import ensure_lineax_sharding_compatibility
+
+        ensure_lineax_sharding_compatibility()
         solver = dx.Kvaerno5()
     else:
         raise ValueError(
@@ -289,6 +317,15 @@ def update_chemistry(
         chemistry_params.metal_mass_fraction,
     )
     temperature_kelvin = code_temperature * chemistry_params.temperature_unit_kelvin
+
+    # Clamp the temperature that seeds the stiff solve to a physical range. In a
+    # run with extreme density contrast a floored/shocked cell can yield a
+    # non-physical P/rho (hence T); starting the solver from a sane value keeps
+    # the reaction network well-posed (the thermochemistry rate expressions apply
+    # their own internal clamp too).
+    temperature_kelvin = jnp.clip(
+        temperature_kelvin, chemistry_params.floor_temperature, 1.0e9
+    )
 
     time_step_seconds = time_step * chemistry_params.time_unit_seconds
 
@@ -355,10 +392,27 @@ def update_chemistry(
         co_cooling_table=chemistry_params.co_cooling_table,
         co_cooling_bounds=chemistry_params.co_cooling_bounds,
     )
-    reacted_per_cell = jax.vmap(react_one_cell)(
-        species_per_cell,
-        temperature_per_cell,
-    )
+    # At full grid resolution a single ``vmap`` over every cell materialises the
+    # stiff solver's per-cell working set for the whole grid at once, which is
+    # the memory bottleneck (the state itself is small). When a chunk size is
+    # configured and smaller than the grid, react the grid in sequential chunks
+    # via ``jax.lax.map``: it vmaps ``react_one_cell`` over ``batch_size`` cells
+    # at a time (so a saturated chunk keeps full throughput) and scans over the
+    # chunks (so only one chunk's working set is live). The per-cell solves are
+    # independent, so this is numerically identical to the unchunked vmap and
+    # only bounds peak memory.
+    chunk_size = chemistry_config.reaction_chunk_size
+    if 0 < chunk_size < number_of_cells:
+        reacted_per_cell = jax.lax.map(
+            lambda cell: react_one_cell(cell[0], cell[1]),
+            (species_per_cell, temperature_per_cell),
+            batch_size=chunk_size,
+        )
+    else:
+        reacted_per_cell = jax.vmap(react_one_cell)(
+            species_per_cell,
+            temperature_per_cell,
+        )
 
     # -------------------------------------------------------------
     # =============== ↑ React every cell (vmapped) ↑ ==============
@@ -390,6 +444,22 @@ def update_chemistry(
             grid_shape
         )
 
+        # Cooling limiter: cap the fractional temperature change per operator-
+        # split step to ``cooling_courant``. Applying the full stiff-cooling
+        # temperature drop in one step makes the fixed-grid hydro (which then sees
+        # the new pressure) go unstable when the cooling time is far below the CFL
+        # step; limiting |dT|/T per step bounds the pressure change the hydro sees
+        # and keeps the coupling stable, while the timestep stays at the (fast)
+        # hydro CFL. A cell that wants to cool further simply does so over the next
+        # few steps (it converges to the same equilibrium). This is the standard
+        # remedy for stiff radiative cooling coupled to a grid scheme.
+        maximum_fractional_change = chemistry_params.cooling_courant
+        reacted_temperature_kelvin = jnp.clip(
+            reacted_temperature_kelvin,
+            temperature_kelvin * (1.0 - maximum_fractional_change),
+            temperature_kelvin * (1.0 + maximum_fractional_change),
+        )
+
         # Never let heating/cooling push the temperature below the floor.
         reacted_temperature_kelvin = jnp.maximum(
             reacted_temperature_kelvin,
@@ -416,3 +486,4 @@ def update_chemistry(
     # -------------------------------------------------------------
 
     return primitive_state
+

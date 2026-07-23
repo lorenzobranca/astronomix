@@ -96,10 +96,12 @@ def build_chemistry_from_network_file(
     relative_tolerance: float = 1e-10,
     solver: int = KVAERNO5,
     max_steps: int = 4096,
+    reaction_chunk_size: int = 0,
     thermochemistry: bool = False,
     dust_to_gas_ratio: float = 1e-2,
     floor_temperature: float = 1e1,
     hydrogen_molecule_formation_rate_coefficient: float = 3e-17,
+    cooling_courant: float = 0.1,
     co_cooling: bool = False,
     co_cooling_table_path: str = DEFAULT_CO_COOLING_TABLE_PATH,
 ) -> Tuple[ChemistryConfig, ChemistryParams, Tuple[str, ...]]:
@@ -119,6 +121,10 @@ def build_chemistry_from_network_file(
         relative_tolerance: Relative tolerance of the stiff solver.
         solver: Stiff-solver tag (see ``chemistry_options``).
         max_steps: Maximum internal Diffrax steps per cell per hydro step.
+        reaction_chunk_size: React the grid in sequential chunks of this many
+            cells (bounds the stiff solver's peak memory) instead of a single
+            vmap over the whole grid. Zero (default) reacts the whole grid at
+            once. See ``ChemistryConfig.reaction_chunk_size``.
         thermochemistry: When True, evolve the temperature with the abundances
             (heating/cooling) and write the result back into the pressure field.
         dust_to_gas_ratio: Dust-to-gas mass ratio (grain photoelectric heating).
@@ -175,6 +181,7 @@ def build_chemistry_from_network_file(
         number_of_reactions=number_of_reactions,
         solver=solver,
         max_steps=max_steps,
+        reaction_chunk_size=reaction_chunk_size,
         thermochemistry=thermochemistry,
         hydrogen_index=species_index("H"),
         molecular_hydrogen_index=species_index("H2"),
@@ -197,6 +204,7 @@ def build_chemistry_from_network_file(
         visual_extinction=visual_extinction,
         dust_to_gas_ratio=dust_to_gas_ratio,
         floor_temperature=floor_temperature,
+        cooling_courant=cooling_courant,
         hydrogen_molecule_formation_rate_coefficient=(
             hydrogen_molecule_formation_rate_coefficient
         ),

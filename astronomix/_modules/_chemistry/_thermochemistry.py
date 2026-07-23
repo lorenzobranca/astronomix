@@ -157,7 +157,11 @@ def _hydrogen_molecule_formation_heating(
         abundances, molecular_hydrogen_index
     )
     # Total hydrogen nuclei density (KROME's ``get_Hnuclei``, dominant terms).
-    hydrogen_nuclei_density = hydrogen_density + 2.0 * molecular_hydrogen_density
+    # Floored so the fractions below stay finite in a (transiently) hydrogen-free
+    # cell; the formation rate itself vanishes there, so the heating stays zero.
+    hydrogen_nuclei_density = jnp.maximum(
+        hydrogen_density + 2.0 * molecular_hydrogen_density, 1e-30
+    )
 
     # Critical-density partition (KROME heatingChem): the fraction of the 4.48 eV
     # that thermalises rises toward unity above the critical density ``ncr``.
@@ -171,6 +175,7 @@ def _hydrogen_molecule_formation_heating(
     critical_density = critical_numerator / (
         critical_denominator_hydrogen * hydrogen_fraction
         + critical_denominator_molecular * molecular_fraction
+        + 1e-30
     )
     thermalised_fraction = 1.0 / (1.0 + critical_density / hydrogen_nuclei_density)
 
@@ -211,6 +216,15 @@ def heating_rate(
     Returns:
         The total heating rate.
     """
+    # The stiff solver probes intermediate states where the temperature or the
+    # abundances can transiently be non-physical (negative, zero, or enormous).
+    # Clamp them to a safe range up front so the powers, square roots and
+    # divisions below cannot emit NaNs/infs that would poison the whole vmapped
+    # solve. Physical trajectories (T ~ 10-1e4 K, non-negative densities) are
+    # untouched by the clamp.
+    temperature_kelvin = jnp.clip(temperature_kelvin, 3.0, 1.0e9)
+    abundances = jnp.maximum(abundances, 0.0)
+
     hydrogen_density = _species_density(abundances, hydrogen_index)
     molecular_hydrogen_density = _species_density(
         abundances, molecular_hydrogen_index
@@ -733,6 +747,12 @@ def cooling_rate(
     Returns:
         The total cooling rate.
     """
+    # See ``heating_rate``: clamp the solver's intermediate temperature and
+    # abundances to a safe range so the log10 / power / exp / division terms in
+    # the coolants cannot emit NaNs. Physical states are unaffected.
+    temperature_kelvin = jnp.clip(temperature_kelvin, 3.0, 1.0e9)
+    abundances = jnp.maximum(abundances, 0.0)
+
     hydrogen_density = _species_density(abundances, hydrogen_index)
     electron_density = _species_density(abundances, electron_index)
 
@@ -860,7 +880,9 @@ def temperature_derivative(
         co_cooling_bounds,
     )
 
-    total_number_density = jnp.sum(abundances)
+    # Floor the total particle density so the normalisation cannot divide by
+    # zero in a (transiently) empty cell.
+    total_number_density = jnp.maximum(jnp.sum(jnp.maximum(abundances, 0.0)), 1e-30)
     return (
         (adiabatic_index - 1.0)
         * net_heating
