@@ -37,6 +37,10 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 
 # astronomix functions
 from astronomix._modules._chemistry._chemistry import update_chemistry
+from astronomix._finite_volume._sharding import (
+    run_in_shard_map,
+    get_active_fv_sharding,
+)
 from astronomix._modules._cnn_mhd_corrector._cnn_mhd_corrector import _cnn_mhd_corrector
 from astronomix._modules._cooling._cooling import update_pressure_by_cooling
 from astronomix._modules._cosmic_rays.cr_injection import inject_crs_at_strongest_shock
@@ -149,13 +153,36 @@ def _iteration_level_updates(
     # Astrochemistry. The species advect with the flow (handled by the solver);
     # here they are reacted per cell. Finite-volume only for now.
     if config.chemistry_config.chemistry and config.solver_mode == FINITE_VOLUME:
-        primitive_state = update_chemistry(
-            primitive_state,
-            registered_variables,
-            config.chemistry_config,
-            params,
-            dt,
-        )
+        # The per-cell reaction is embarrassingly parallel (no stencil). Under
+        # multi-GPU sharding run it inside a shard_map so each device reacts only
+        # its local slab: this avoids gathering the whole grid to one device (an
+        # all-gather that also confuses diffrax's closure conversion) and gives a
+        # near-linear speed-up on the dominant cost. On one device it is a plain
+        # call.
+        fv_sharding = get_active_fv_sharding()
+        if fv_sharding is not None:
+            # dt and params are passed as replicated shard_map arguments (not
+            # closed over: explicit-mesh mode forbids capturing sharded inputs).
+            primitive_state = run_in_shard_map(
+                lambda local_state, dt_local, params_local: update_chemistry(
+                    local_state,
+                    registered_variables,
+                    config.chemistry_config,
+                    params_local,
+                    dt_local,
+                ),
+                primitive_state,
+                fv_sharding,
+                replicated_args=(dt, params),
+            )
+        else:
+            primitive_state = update_chemistry(
+                primitive_state,
+                registered_variables,
+                config.chemistry_config,
+                params,
+                dt,
+            )
 
     # Neural-network body force.
     if config.neural_net_force_config.neural_net_force:

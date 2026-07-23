@@ -41,7 +41,7 @@ from astronomix._modules._gravity._poisson_solver import (
     _compute_gravitational_potential,
 )
 from astronomix._finite_volume._state_evolution.limiters import _van_albada_limiter, _minmod
-from astronomix._stencil_operations._stencil_operations import _stencil_add
+from astronomix._stencil_operations._stencil_operations import _stencil_add, custom_roll
 from astronomix._fluid_equations._equations import speed_of_sound
 from astronomix._finite_volume._state_evolution.limited_gradients import _calculate_limited_gradients
 
@@ -62,6 +62,23 @@ def _reconstruct_at_interface_split(
     rho = primitive_state[registered_variables.density_index]
     p = primitive_state[registered_variables.pressure_index]
     u = primitive_state[axis]
+
+    # Mass-fraction (specific-abundance) reconstruction for the chemical species.
+    # The species are carried as absolute number densities that span ~9 orders of
+    # magnitude (fraction x density, both with huge dynamic range); reconstructing
+    # them directly makes the high-order interface extrapolation produce
+    # non-physical / non-finite states. Instead reconstruct the specific abundance
+    # X_i = n_i / rho (bounded, ~O(fraction)); the interface values are turned back
+    # into number densities below using the reconstructed interface density, so the
+    # species stay consistent with the mass flux. No-op when chemistry is off.
+    if registered_variables.chemistry_species_active:
+        species_start = registered_variables.chemistry_species_index
+        number_of_species = registered_variables.num_chemical_species
+        primitive_state = primitive_state.at[
+            species_start : species_start + number_of_species
+        ].set(
+            primitive_state[species_start : species_start + number_of_species] / rho
+        )
 
     # get the limited gradients on the cells
     limited_gradients = _calculate_limited_gradients(
@@ -130,12 +147,34 @@ def _reconstruct_at_interface_split(
     primitives_right = predictors + distances_to_right_interfaces * limited_gradients
 
     # primitives left at i is the left state at the interface
-    # between i-1 and i so the right extrapolation from the cell i-1
-    p_left_interface = jnp.roll(primitives_right, shift=1, axis=axis)
+    # between i-1 and i so the right extrapolation from the cell i-1.
+    # ``custom_roll`` so the shift crosses device-slab boundaries under sharding
+    # (a plain ``jnp.roll`` would wrap within each slab and corrupt the halos).
+    p_left_interface = custom_roll(primitives_right, 1, axis)
 
     # primitives right at i is the right state at the interface
     # between i-1 and i so the left extrapolation from the cell i
     p_right_interface = primitives_left
+
+    # Convert the reconstructed specific abundances X_i back into number
+    # densities n_i = X_i * rho at each interface, using the reconstructed
+    # interface density (so species advect consistently with the mass flux).
+    if registered_variables.chemistry_species_active:
+        species_start = registered_variables.chemistry_species_index
+        number_of_species = registered_variables.num_chemical_species
+        density_index = registered_variables.density_index
+        p_left_interface = p_left_interface.at[
+            species_start : species_start + number_of_species
+        ].set(
+            p_left_interface[species_start : species_start + number_of_species]
+            * p_left_interface[density_index]
+        )
+        p_right_interface = p_right_interface.at[
+            species_start : species_start + number_of_species
+        ].set(
+            p_right_interface[species_start : species_start + number_of_species]
+            * p_right_interface[density_index]
+        )
 
     return p_left_interface, p_right_interface
 

@@ -47,6 +47,11 @@ from astronomix.data_classes.simulation_snapshot_data import SnapshotData
 
 # astronomix functions
 from astronomix._finite_volume._state_evolution.evolve_state import _evolve_state_fv
+from astronomix._finite_volume._sharding import (
+    run_in_shard_map,
+    get_active_fv_sharding,
+    fv_sharding_context,
+)
 from astronomix._finite_difference._state_evolution._evolve_state import _evolve_state_fd
 from astronomix._finite_volume._timestep_estimation._timestep_estimator import (
     _cfl_time_step,
@@ -398,7 +403,7 @@ def time_integration(
         if config.print_elapsed_time:
             if not config.memory_analysis:
                 # compile the time integration function
-                with mesh_ctx, pallas_mesh_context(pallas_mesh):
+                with mesh_ctx, pallas_mesh_context(pallas_mesh), fv_sharding_context(sharding):
                     time_integration_jit.lower(
                         primitive_state,
                         config,
@@ -412,7 +417,7 @@ def time_integration(
             print("🚀 Starting simulation...")
 
         try:
-            with mesh_ctx, pallas_mesh_context(pallas_mesh):
+            with mesh_ctx, pallas_mesh_context(pallas_mesh), fv_sharding_context(sharding):
                 final_state = time_integration_jit(
                     primitive_state,
                     config,
@@ -658,15 +663,103 @@ def _integrate_core(
 
         # evolve the state
         if config.solver_mode == FINITE_VOLUME:
-            primitive_state = _evolve_state_fv(
-                primitive_state, dt, params.gamma, config, params,
-                helper_data_pad, registered_variables,
-            )
+            # Under multi-GPU sharding the finite-volume stencils must run inside
+            # a shard_map (their rolls become ppermute halo exchanges); on a
+            # single device this wrapper is a plain call. The sharding is exposed
+            # by the outer ``time_integration`` via ``fv_sharding_context``.
+            fv_sharding = get_active_fv_sharding()
+            if fv_sharding is not None:
+                # dt and params are passed as (replicated) shard_map arguments,
+                # not closed over (explicit-mesh mode forbids capturing sharded
+                # inputs). helper_data is unused by the Cartesian finite-volume
+                # evolve (all its accesses are geometry-gated), so None is passed.
+                primitive_state = run_in_shard_map(
+                    lambda local_state, dt_local, params_local: _evolve_state_fv(
+                        local_state, dt_local, params_local.gamma, config,
+                        params_local, None, registered_variables,
+                    ),
+                    primitive_state,
+                    fv_sharding,
+                    replicated_args=(dt, params),
+                )
+            else:
+                primitive_state = _evolve_state_fv(
+                    primitive_state, dt, params.gamma, config, params,
+                    helper_data_pad, registered_variables,
+                )
         elif config.solver_mode == FINITE_DIFFERENCE:
             primitive_state = _evolve_state_fd(
                 primitive_state, dt, params.gamma, config, params,
                 helper_data_pad, registered_variables,
             )
+
+        # nan-safe hydro backstop: reset any cell that went non-finite in the
+        # finite-volume evolve to a floored rest state, so a handful of
+        # pathological cells cannot spread NaNs across the grid and kill the
+        # coupled run. Two failure modes seed these cells: void/cloud interfaces
+        # under strong cooling, and — with MHD — the deep resampled voids where the
+        # seeded field over a floored density gives a huge Alfven speed. The reset
+        # must cover EVERY evolved field: a cell left with a non-finite magnetic
+        # component feeds a nan fast-magnetosonic wave speed into the next
+        # timestep estimate (nan dt -> "nan encountered in while"). Scoped to
+        # finite-volume thermochemistry, where the stiff cooling is active.
+        if (
+            config.solver_mode == FINITE_VOLUME
+            and config.chemistry_config.chemistry
+            and config.chemistry_config.thermochemistry
+        ):
+            cell_finite = jnp.all(jnp.isfinite(primitive_state), axis=0)
+            species_start = registered_variables.chemistry_species_index
+            number_of_species = registered_variables.num_chemical_species
+            primitive_state = primitive_state.at[
+                registered_variables.density_index
+            ].set(
+                jnp.where(
+                    cell_finite,
+                    primitive_state[registered_variables.density_index],
+                    params.minimum_density,
+                )
+            )
+            primitive_state = primitive_state.at[
+                registered_variables.pressure_index
+            ].set(
+                jnp.where(
+                    cell_finite,
+                    primitive_state[registered_variables.pressure_index],
+                    params.minimum_pressure,
+                )
+            )
+            for velocity_component in (
+                registered_variables.velocity_index.x,
+                registered_variables.velocity_index.y,
+                registered_variables.velocity_index.z,
+            ):
+                primitive_state = primitive_state.at[velocity_component].set(
+                    jnp.where(cell_finite, primitive_state[velocity_component], 0.0)
+                )
+            primitive_state = primitive_state.at[
+                species_start : species_start + number_of_species
+            ].set(
+                jnp.where(
+                    cell_finite[None, ...],
+                    primitive_state[species_start : species_start + number_of_species],
+                    0.0,
+                )
+            )
+            # The magnetic field is an evolved field too: leaving it non-finite in
+            # a repaired void cell reintroduces the nan through the Alfven-speed
+            # term of the next CFL estimate. Reset the field to zero there.
+            if config.mhd:
+                for magnetic_component in (
+                    registered_variables.magnetic_index.x,
+                    registered_variables.magnetic_index.y,
+                    registered_variables.magnetic_index.z,
+                ):
+                    primitive_state = primitive_state.at[magnetic_component].set(
+                        jnp.where(
+                            cell_finite, primitive_state[magnetic_component], 0.0
+                        )
+                    )
 
         return dt, LoopState(primitive_state, key, forcing)
 
@@ -1019,7 +1112,7 @@ def _time_integration_to_disk(
                     lambda leaf: jax.device_put(leaf, replicated), segment_params
                 )
 
-            with mesh_ctx, pallas_mesh_context(pallas_mesh):
+            with mesh_ctx, pallas_mesh_context(pallas_mesh), fv_sharding_context(sharding):
                 t_final, primitive_state, key, forcing, num_iterations = run_segment_jit(
                     primitive_state,
                     segment_config,

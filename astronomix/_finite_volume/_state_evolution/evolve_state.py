@@ -576,15 +576,46 @@ def _evolve_state_fv(
     if config.mhd:
         if config.dimensionality > 1:
 
-            # WARNING: this relies on the last three state indices being the
-            # magnetic-field components, so that stripping them off yields the
-            # pure gas sub-state and a matching gas variable registry.
+            # The magnetic field occupies three contiguous slots starting at
+            # ``magnetic_index.x`` (right after the pressure) — NOT necessarily the
+            # last three, because advected tracers (chemistry species, cosmic rays,
+            # wind density) are registered after the magnetic block. Strip the
+            # magnetic rows out of the middle so the gas sub-state keeps density /
+            # velocity / pressure at the front with the tracers trailing (they
+            # advect with the flow), then reinsert the field into its slot below.
+            magnetic_start = registered_variables.magnetic_index.x
+
+            # Stripping the three magnetic rows shifts every row that sat after
+            # them down by three. The advected tracers (wind density, cosmic rays,
+            # chemistry species) trail the magnetic block, so their indices must be
+            # decremented to stay valid in the gas sub-state; index-sensitive
+            # handling (e.g. the mass-fraction species reconstruction) reads them
+            # from ``registered_variables_gas`` and would otherwise address the
+            # wrong rows. Inactive tracers keep their ``-1`` sentinel.
+            def _shift_after_magnetic_block(index: int) -> int:
+                return index - 3 if index > magnetic_start else index
+
             registered_variables_gas = registered_variables._replace(
-                num_vars=registered_variables.num_vars - 3
+                num_vars=registered_variables.num_vars - 3,
+                wind_density_index=_shift_after_magnetic_block(
+                    registered_variables.wind_density_index
+                ),
+                cosmic_ray_n_index=_shift_after_magnetic_block(
+                    registered_variables.cosmic_ray_n_index
+                ),
+                chemistry_species_index=_shift_after_magnetic_block(
+                    registered_variables.chemistry_species_index
+                ),
             )
 
-            gas_state = primitive_state[:-3, ...]
-            magnetic_field = primitive_state[-3:, ...]
+            gas_state = jnp.concatenate(
+                [
+                    primitive_state[:magnetic_start],
+                    primitive_state[magnetic_start + 3 :],
+                ],
+                axis=0,
+            )
+            magnetic_field = primitive_state[magnetic_start : magnetic_start + 3, ...]
 
             if config.split == UNSPLIT:
                 evolved_gas = _evolve_gas_state_unsplit(
@@ -638,7 +669,15 @@ def _evolve_state_fv(
                     registered_variables_gas,
                 )
 
-            return jnp.concatenate((evolved_gas, magnetic_field), axis=0)
+            # reinsert the magnetic field into its original (middle) slot
+            return jnp.concatenate(
+                [
+                    evolved_gas[:magnetic_start],
+                    magnetic_field,
+                    evolved_gas[magnetic_start:],
+                ],
+                axis=0,
+            )
         else:
             raise ValueError("MHD currently not supported in 1D.")
 
