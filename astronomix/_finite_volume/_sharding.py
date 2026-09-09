@@ -219,6 +219,25 @@ def run_in_shard_map(function, primitive_state, sharding, replicated_args=()):
     )(primitive_state, *replicated_args)
 
 
+def distributed_max(scalar):
+    """Global maximum of a per-device scalar across the sharded axis.
+
+    Inside a ``shard_map`` a plain ``jnp.max`` reduces only over the LOCAL slab, so
+    every device gets a different answer. Any control-flow decision taken on such a
+    value diverges between devices -- and if the divergent branch contains a
+    collective (``ppermute`` from :func:`distributed_roll`, say), the devices
+    deadlock: one leaves the loop while the other waits for a partner that will
+    never arrive. Reducing with ``pmax`` first makes the decision unanimous.
+
+    Outside a sharding context this is the identity, so single-device numerics are
+    bit-for-bit unchanged.
+    """
+    context = get_shard_axis_context()
+    if context is None:
+        return scalar
+    return jax.lax.pmax(scalar, context.axis_name)
+
+
 def all_gather_sharded_axis(local_array, axis):
     """Gather the (sharded) ``axis`` into a full replicated array.
 

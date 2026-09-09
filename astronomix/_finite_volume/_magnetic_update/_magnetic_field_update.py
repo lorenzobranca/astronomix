@@ -39,6 +39,7 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 
 # astronomix functions
 from astronomix._geometry.boundaries import _boundary_handler
+from astronomix._finite_volume._sharding import distributed_max
 from astronomix._finite_volume._magnetic_update._vector_maths import (
     cross,
     curl2D,
@@ -143,24 +144,42 @@ def magnetic_update(
         B_1 = _boundary_handler(B_1, config, registered_variables, params, MAGNETIC_FIELD_ONLY)
         v_1 = _boundary_handler(v_1, config, registered_variables, params, VELOCITY_ONLY)
 
-    def while_condition(state):
-        B_k, v_k, B_kp1, v_kp1, current_iter = state
-        max_change = jnp.maximum(
+    if config.numerical_precision == SINGLE_PRECISION:
+        change_criterion = 1e-5
+    elif config.numerical_precision == DOUBLE_PRECISION:
+        change_criterion = 1e-10
+    else:
+        raise ValueError("Unknown numerical precision.")
+
+    def max_change_of(B_k, v_k, B_kp1, v_kp1):
+        """Convergence measure for the eigen-iteration, reduced ACROSS devices.
+
+        ``jnp.max`` inside a ``shard_map`` reduces only over the local slab, so each
+        device would reach its own verdict on convergence and run a different number
+        of iterations. ``while_body`` issues ``ppermute`` collectives (via the
+        curl/divergence stencils), so divergent trip counts deadlock: the device that
+        exits first leaves its partner waiting at a collective forever. That was the
+        observed 2-GPU failure -- a hang at ``kCollectivePermute`` with only one of
+        two threads arriving. ``distributed_max`` makes the verdict unanimous.
+
+        Outside a sharding context it is the identity, so single-device behaviour
+        (including the exact iteration count) is unchanged.
+        """
+        local_change = jnp.maximum(
             jnp.max(jnp.linalg.norm(B_k - B_kp1, axis=0)),
             jnp.max(jnp.linalg.norm(v_k - v_kp1, axis=0)),
         )
-        
-        if config.numerical_precision == SINGLE_PRECISION:
-            change_criterion = 1e-5
-        elif config.numerical_precision == DOUBLE_PRECISION:
-            change_criterion = 1e-10
-        else:
-            raise ValueError("Unknown numerical precision.")
-        
+        return distributed_max(local_change)
+
+    def while_condition(state):
+        # The convergence measure is carried in the state rather than recomputed
+        # here, so the collective inside ``max_change_of`` lives in the loop BODY.
+        # A collective in a while-condition is a far less well-trodden construct.
+        _, _, _, _, current_iter, max_change = state
         return (max_change > change_criterion) & (current_iter < 1000)
 
     def while_body(state):
-        B_k, v_k, B_kp1, v_kp1, current_iter = state
+        B_k, v_k, B_kp1, v_kp1, current_iter, _ = state
 
         B_k = B_kp1
         v_k = v_kp1
@@ -181,15 +200,22 @@ def magnetic_update(
             B_kp1 = _boundary_handler(B_kp1, config, registered_variables, params, MAGNETIC_FIELD_ONLY)
             v_kp1 = _boundary_handler(v_kp1, config, registered_variables, params, VELOCITY_ONLY)
 
-        return B_k, v_k, B_kp1, v_kp1, current_iter + 1
+        return (
+            B_k, v_k, B_kp1, v_kp1, current_iter + 1,
+            max_change_of(B_k, v_k, B_kp1, v_kp1),
+        )
+
+    initial_state = (
+        B_0, v_0, B_1, v_1, 0, max_change_of(B_0, v_0, B_1, v_1),
+    )
 
     if config.differentiation_mode == FORWARDS:
-        _, _, B_n, v_n, _ = jax.lax.while_loop(
-            while_condition, while_body, (B_0, v_0, B_1, v_1, 0)
+        _, _, B_n, v_n, _, _ = jax.lax.while_loop(
+            while_condition, while_body, initial_state
         )
     elif config.differentiation_mode == BACKWARDS:
-        _, _, B_n, v_n, _ = checkpointed_while_loop(
-            while_condition, while_body, (B_0, v_0, B_1, v_1, 0), checkpoints=3
+        _, _, B_n, v_n, _, _ = checkpointed_while_loop(
+            while_condition, while_body, initial_state, checkpoints=3
         )
 
     if config.runtime_debugging:
