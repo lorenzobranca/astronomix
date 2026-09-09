@@ -709,6 +709,16 @@ def _integrate_core(
             and config.chemistry_config.thermochemistry
         ):
             cell_finite = jnp.all(jnp.isfinite(primitive_state), axis=0)
+            # Report how many cells the backstop repairs this step (only when it
+            # fires, so a clean run prints nothing). A steady trickle means a
+            # localised problem; a jump to the whole grid means a global one.
+            repaired_cells = jnp.sum(~cell_finite)
+            jax.lax.cond(
+                repaired_cells > 0,
+                lambda n: jax.debug.print("NANREPAIR bad_cells={n}", n=n),
+                lambda n: None,
+                repaired_cells,
+            )
             species_start = registered_variables.chemistry_species_index
             number_of_species = registered_variables.num_chemical_species
             primitive_state = primitive_state.at[

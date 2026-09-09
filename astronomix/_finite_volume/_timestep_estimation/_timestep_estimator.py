@@ -118,6 +118,20 @@ def get_wave_speeds(
     wave_speeds_right_plus = jnp.abs(u_L) + c_L
     wave_speeds_left_minus = jnp.abs(u_R) + c_R
 
+    # nan-safe reduction: a single cell with a non-finite or non-positive
+    # pressure/density (which the sqrt above turns into nan) must not poison the
+    # GLOBAL maximum -- ``jnp.max`` propagates nan, the timestep becomes nan, and
+    # the next evolve then takes every cell in the grid non-finite at once, so
+    # the per-cell nan backstop ends up flooring the whole domain. Drop such
+    # cells from the reduction (they are repaired by the backstop after the
+    # evolve); the remaining finite cells still bound the timestep.
+    wave_speeds_right_plus = jnp.where(
+        jnp.isfinite(wave_speeds_right_plus), wave_speeds_right_plus, 0.0
+    )
+    wave_speeds_left_minus = jnp.where(
+        jnp.isfinite(wave_speeds_left_minus), wave_speeds_left_minus, 0.0
+    )
+
     max_wave_speed = jnp.maximum(
         jnp.max(jnp.abs(wave_speeds_right_plus)),
         jnp.max(jnp.abs(wave_speeds_left_minus)),
@@ -210,6 +224,11 @@ def _cfl_time_step(
 
         if config.use_max_adaptive_timestep:
             dt = jnp.minimum(dt, dt_max)
+
+        # Final guard: never hand a non-finite or non-positive step to the
+        # evolve (a nan dt is a global catastrophe, see ``get_wave_speeds``).
+        # ``dt_max`` is the natural finite fallback for the split scheme.
+        dt = jnp.where(jnp.isfinite(dt) & (dt > 0.0), dt, dt_max)
 
     # viscous time step constraint
     if config.diffusion:
