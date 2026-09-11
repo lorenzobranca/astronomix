@@ -22,6 +22,9 @@ import jax.numpy as jnp
 KVAERNO5 = 1
 DOPRI5 = 2
 TSIT5 = 3
+# Neural emulator of the per-cell operator (species, T, dt) -> (species, T); see
+# ``_chemistry._emulate_single_cell`` and ``setup_helpers.attach_emulator``.
+EMULATOR = 4
 
 
 class ChemistryConfig(NamedTuple):
@@ -91,6 +94,22 @@ class ChemistryConfig(NamedTuple):
     ionized_carbon_index: int = -1
     co_cooling: bool = False
     carbon_monoxide_index: int = -1
+    # --- neural emulator (solver == EMULATOR) ---
+    emulator_activation: str = "softplus"
+    emulator_residual: bool = True
+    # After the emulator step, rescale the H-bearing species to the cell's
+    # hydrogen-nuclei budget and reset electrons to charge neutrality.
+    emulator_project_conservation: bool = True
+    # Guards against off-manifold runaway (an emulator is unbounded where it was
+    # not trained): clip standardised inputs to +-this many sigma, and cap the
+    # per-step change of log10 species fractions and of log10 T (dex; 0 = off).
+    # Species are bounded by the per-element projection (a species can never
+    # exceed its element's budget), so the species cap is off by default; the
+    # stiff solve itself moves species by up to ~6 dex and T by up to ~2.6 dex in
+    # one hydro step in hot dense gas, so the T cap only stops the absurd.
+    emulator_input_clip_sigma: float = 5.0
+    emulator_max_log_change: float = 0.0
+    emulator_max_log_temperature_change: float = 3.0
 
 
 class ChemistryParams(NamedTuple):
@@ -173,3 +192,20 @@ class ChemistryParams(NamedTuple):
     # tabulated CO rotational cooling (Neufeld & Kaufman 1993)
     co_cooling_table: jnp.ndarray = jnp.array([])
     co_cooling_bounds: jnp.ndarray = jnp.array([])
+    # --- neural emulator leaves (solver == EMULATOR); filled by attach_emulator ---
+    # Dense layers W_i (out, in) and b_i, applied as act(W h + b); the last layer is linear.
+    emulator_weights: Tuple[jnp.ndarray, ...] = ()
+    emulator_biases: Tuple[jnp.ndarray, ...] = ()
+    # Standardisation of the 17 quantities [log10 x_i (species), log10 T] and of log10 nH.
+    emulator_input_mean: jnp.ndarray = jnp.array([])
+    emulator_input_std: jnp.ndarray = jnp.array([])
+    emulator_param_mean: float = 0.0
+    emulator_param_std: float = 1.0
+    # The time grid [s] (t=0 + saved times) whose index fraction is the model's time input.
+    emulator_time_grid: jnp.ndarray = jnp.array([])
+    # Hydrogen atoms and charge per species (for the conservation projection).
+    emulator_hydrogen_atoms: jnp.ndarray = jnp.array([])
+    emulator_charges: jnp.ndarray = jnp.array([])
+    # Atoms of each element per species, shape (species, elements); every element is
+    # conserved per cell by rescaling its species after the emulator step.
+    emulator_element_matrix: jnp.ndarray = jnp.array([])

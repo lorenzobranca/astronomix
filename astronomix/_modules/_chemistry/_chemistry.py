@@ -38,7 +38,7 @@ import jax
 import jax.numpy as jnp
 
 # astronomix constants
-from astronomix._modules._chemistry.chemistry_options import KVAERNO5
+from astronomix._modules._chemistry.chemistry_options import EMULATOR, KVAERNO5
 from astronomix.option_classes.simulation_config import STATE_TYPE
 
 # astronomix containers
@@ -244,6 +244,116 @@ def _advance_single_cell(
     return final_state
 
 
+def _emulate_single_cell(
+    cell_abundances,
+    cell_temperature_kelvin,
+    time_step_seconds,
+    chemistry_config,
+    chemistry_params,
+):
+    """Advance one cell with the neural emulator instead of the stiff solve.
+
+    Mirrors the operator the emulator was trained on (CODES FullyConnected /
+    FullyConnectedResidual on the cloud-collision carbox dataset): the input is
+    the standardised ``[log10 x_i, log10 T]`` with ``x_i = n_i / n_H,nuclei``, the
+    index fraction of the elapsed time on the model's time grid, and the
+    standardised ``log10 n_H``; the output is the standardised
+    ``[log10 x_i(t), log10 T(t)]`` (added to the input for the residual variant).
+
+    Afterwards, optionally, the H-bearing species are rescaled to the cell's
+    hydrogen-nuclei budget (which the hydro conserves and the emulator does not
+    know about) and the electrons are reset to charge neutrality.
+
+    Args:
+        cell_abundances: Species number densities [cm^-3].
+        cell_temperature_kelvin: Gas temperature [K].
+        time_step_seconds: Elapsed time [s] (the hydro step).
+        chemistry_config: Static configuration (activation, residual flag, roles).
+        chemistry_params: The emulator leaves (weights, standardisation, grid).
+
+    Returns:
+        ``concat(abundances [cm^-3], T [K])`` as ``_advance_single_cell`` with
+        thermochemistry does.
+    """
+    p = chemistry_params
+    hydrogen_atoms = p.emulator_hydrogen_atoms
+    hydrogen_nuclei = jnp.maximum(jnp.dot(hydrogen_atoms, cell_abundances), 1e-30)
+
+    log_fractions = jnp.log10(jnp.clip(cell_abundances / hydrogen_nuclei, 1e-30, None))
+    log_temperature = jnp.log10(jnp.clip(cell_temperature_kelvin, 1.0, 1e9))
+    state = jnp.concatenate([log_fractions, jnp.reshape(log_temperature, (1,))])
+    standardised = (state - p.emulator_input_mean) / p.emulator_input_std
+    # Keep the network inside the range it was trained on; the residual below is
+    # still added to the TRUE (unclipped) state, so this only bounds the correction.
+    clip = chemistry_config.emulator_input_clip_sigma
+    network_input = jnp.clip(standardised, -clip, clip) if clip > 0 else standardised
+
+    grid = p.emulator_time_grid
+    tau = jnp.interp(
+        jnp.clip(time_step_seconds, grid[0], grid[-1]),
+        grid,
+        jnp.linspace(0.0, 1.0, grid.shape[0]),
+    )
+    parameter = (jnp.log10(hydrogen_nuclei) - p.emulator_param_mean) / p.emulator_param_std
+    parameter = jnp.clip(parameter, -clip, clip) if clip > 0 else parameter
+    features = jnp.concatenate(
+        [network_input, jnp.reshape(tau, (1,)), jnp.reshape(parameter, (1,))]
+    )
+
+    activation = {
+        "softplus": jax.nn.softplus,
+        "gelu": jax.nn.gelu,
+        "silu": jax.nn.silu,
+        "relu": jax.nn.relu,
+    }[chemistry_config.emulator_activation]
+    hidden = features
+    for weight, bias in zip(p.emulator_weights[:-1], p.emulator_biases[:-1]):
+        hidden = activation(weight @ hidden + bias)
+    output = p.emulator_weights[-1] @ hidden + p.emulator_biases[-1]
+    if chemistry_config.emulator_residual:
+        output = output + standardised
+
+    new_state = output * p.emulator_input_std + p.emulator_input_mean
+    # Cap the per-step change (dex). The stiff solve never moves a species by more
+    # than ~0.2 dex or T by more than ~0.5 dex in one hydro step on this network,
+    # so anything beyond is extrapolation error, not chemistry.
+    change = new_state - state
+    cap_x = chemistry_config.emulator_max_log_change
+    cap_t = chemistry_config.emulator_max_log_temperature_change
+    if cap_x > 0:
+        change = change.at[:-1].set(jnp.clip(change[:-1], -cap_x, cap_x))
+    if cap_t > 0:
+        change = change.at[-1].set(jnp.clip(change[-1], -cap_t, cap_t))
+    new_state = state + change
+    new_abundances = 10.0 ** new_state[:-1] * hydrogen_nuclei
+    new_temperature = 10.0 ** new_state[-1]
+
+    if chemistry_config.emulator_project_conservation:
+        # Elements: rescale each element's species so the element's atoms sum to
+        # the budget the cell entered with (the hydro conserves them, the emulator
+        # does not know about them). Species sharing elements (CO, HCO+, ...) make
+        # the passes interact, so sweep the elements twice; the residual
+        # non-conservation after that is far below the emulator's own error.
+        element_matrix = p.emulator_element_matrix  # (species, elements)
+        budgets = jnp.maximum(cell_abundances @ element_matrix, 1e-30)
+        for _ in range(2):
+            for element in range(element_matrix.shape[1]):
+                atoms = element_matrix[:, element]
+                predicted = jnp.maximum(jnp.dot(atoms, new_abundances), 1e-30)
+                scale = budgets[element] / predicted
+                new_abundances = jnp.where(atoms > 0, new_abundances * scale, new_abundances)
+        # Charge: electrons balance the ions.
+        electron = chemistry_config.electron_index
+        if electron >= 0:
+            charges = p.emulator_charges.at[electron].set(0.0)
+            electrons = jnp.maximum(jnp.dot(charges, new_abundances), 1e-30)
+            new_abundances = new_abundances.at[electron].set(electrons)
+
+    new_abundances = jnp.where(jnp.isfinite(new_abundances), new_abundances, cell_abundances)
+    new_temperature = jnp.where(jnp.isfinite(new_temperature), new_temperature, cell_temperature_kelvin)
+    return jnp.concatenate([new_abundances, jnp.reshape(new_temperature, (1,))])
+
+
 @partial(jax.jit, static_argnames=("chemistry_config", "registered_variables"))
 def update_chemistry(
     primitive_state: STATE_TYPE,
@@ -285,7 +395,9 @@ def update_chemistry(
     # reactions and so is not hashable.
     reaction_network = chemistry_params.network
 
-    if chemistry_config.solver == KVAERNO5:
+    if chemistry_config.solver == EMULATOR:
+        solver = None  # no ODE solve: the neural emulator replaces it
+    elif chemistry_config.solver == KVAERNO5:
         import diffrax as dx
 
         from ._sharding_compat import ensure_lineax_sharding_compatibility
@@ -361,37 +473,45 @@ def update_chemistry(
 
     # Bind everything that is shared across cells; vmap only over the per-cell
     # abundances and temperature.
-    react_one_cell = partial(
-        _advance_single_cell,
-        time_step_seconds=time_step_seconds,
-        reaction_network=reaction_network,
-        rate_modifier_a=chemistry_params.rate_modifier_a,
-        rate_modifier_b=chemistry_params.rate_modifier_b,
-        cosmic_ray_rate=chemistry_params.cosmic_ray_rate,
-        fuv_field=chemistry_params.fuv_field,
-        visual_extinction=chemistry_params.visual_extinction,
-        absolute_tolerance=chemistry_params.atol,
-        relative_tolerance=chemistry_params.rtol,
-        solver=solver,
-        max_steps=chemistry_config.max_steps,
-        thermochemistry=chemistry_config.thermochemistry,
-        adiabatic_index=simulation_params.gamma,
-        dust_to_gas_ratio=chemistry_params.dust_to_gas_ratio,
-        hydrogen_molecule_formation_rate_coefficient=(
-            chemistry_params.hydrogen_molecule_formation_rate_coefficient
-        ),
-        hydrogen_index=chemistry_config.hydrogen_index,
-        molecular_hydrogen_index=chemistry_config.molecular_hydrogen_index,
-        electron_index=chemistry_config.electron_index,
-        atomic_oxygen_index=chemistry_config.atomic_oxygen_index,
-        ionized_hydrogen_index=chemistry_config.ionized_hydrogen_index,
-        helium_index=chemistry_config.helium_index,
-        ionized_carbon_index=chemistry_config.ionized_carbon_index,
-        co_cooling=chemistry_config.co_cooling,
-        carbon_monoxide_index=chemistry_config.carbon_monoxide_index,
-        co_cooling_table=chemistry_params.co_cooling_table,
-        co_cooling_bounds=chemistry_params.co_cooling_bounds,
-    )
+    if chemistry_config.solver == EMULATOR:
+        react_one_cell = partial(
+            _emulate_single_cell,
+            time_step_seconds=time_step_seconds,
+            chemistry_config=chemistry_config,
+            chemistry_params=chemistry_params,
+        )
+    else:
+        react_one_cell = partial(
+            _advance_single_cell,
+            time_step_seconds=time_step_seconds,
+            reaction_network=reaction_network,
+            rate_modifier_a=chemistry_params.rate_modifier_a,
+            rate_modifier_b=chemistry_params.rate_modifier_b,
+            cosmic_ray_rate=chemistry_params.cosmic_ray_rate,
+            fuv_field=chemistry_params.fuv_field,
+            visual_extinction=chemistry_params.visual_extinction,
+            absolute_tolerance=chemistry_params.atol,
+            relative_tolerance=chemistry_params.rtol,
+            solver=solver,
+            max_steps=chemistry_config.max_steps,
+            thermochemistry=chemistry_config.thermochemistry,
+            adiabatic_index=simulation_params.gamma,
+            dust_to_gas_ratio=chemistry_params.dust_to_gas_ratio,
+            hydrogen_molecule_formation_rate_coefficient=(
+                chemistry_params.hydrogen_molecule_formation_rate_coefficient
+            ),
+            hydrogen_index=chemistry_config.hydrogen_index,
+            molecular_hydrogen_index=chemistry_config.molecular_hydrogen_index,
+            electron_index=chemistry_config.electron_index,
+            atomic_oxygen_index=chemistry_config.atomic_oxygen_index,
+            ionized_hydrogen_index=chemistry_config.ionized_hydrogen_index,
+            helium_index=chemistry_config.helium_index,
+            ionized_carbon_index=chemistry_config.ionized_carbon_index,
+            co_cooling=chemistry_config.co_cooling,
+            carbon_monoxide_index=chemistry_config.carbon_monoxide_index,
+            co_cooling_table=chemistry_params.co_cooling_table,
+            co_cooling_bounds=chemistry_params.co_cooling_bounds,
+        )
     # At full grid resolution a single ``vmap`` over every cell materialises the
     # stiff solver's per-cell working set for the whole grid at once, which is
     # the memory bottleneck (the state itself is small). When a chunk size is

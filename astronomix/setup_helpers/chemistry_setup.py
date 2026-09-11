@@ -26,7 +26,7 @@ import numpy as np
 import jax.numpy as jnp
 
 # astronomix constants
-from astronomix._modules._chemistry.chemistry_options import KVAERNO5
+from astronomix._modules._chemistry.chemistry_options import EMULATOR, KVAERNO5
 
 # astronomix containers
 from astronomix._modules._chemistry.chemistry_options import (
@@ -217,3 +217,86 @@ def build_chemistry_from_network_file(
     )
 
     return chemistry_config, chemistry_params, species_names
+
+
+def _species_elements_and_charge(name):
+    """Element counts and charge of a species from its name (e.g. ``"H3O+"``)."""
+    import re
+
+    if name.upper() == "E":
+        return {}, -1
+    charge = name.count("+") - name.count("-")
+    core = name.replace("+", "").replace("-", "")
+    counts = {}
+    for element, number in re.findall(r"([A-Z][a-z]?)(\d*)", core):
+        if element:
+            counts[element] = counts.get(element, 0) + (int(number) if number else 1)
+    return counts, charge
+
+
+def _species_hydrogen_and_charge(name):
+    counts, charge = _species_elements_and_charge(name)
+    return counts.get("H", 0), charge
+
+
+def attach_emulator(
+    chemistry_config: ChemistryConfig,
+    chemistry_params: ChemistryParams,
+    emulator_npz_path: str,
+    project_conservation: bool = True,
+) -> Tuple[ChemistryConfig, ChemistryParams]:
+    """Replace the stiff solve by a neural emulator exported to npz.
+
+    The npz (see ``emulator_dataset/export_fcnn_to_npz.py`` in the cloud-collision
+    project) holds the dense layers ``W<i>``/``b<i>``, the standardisation of the
+    17 quantities and of log10 nH, the time grid and the quantity names. The
+    species order must match the registered network's, and thermochemistry must
+    be on (the emulator returns the temperature).
+
+    Args:
+        chemistry_config: Configuration built by ``build_chemistry_from_network_file``.
+        chemistry_params: Its parameters.
+        emulator_npz_path: The exported model.
+        project_conservation: Rescale H-bearing species to the hydrogen budget and
+            reset electrons to neutrality after every emulator step.
+
+    Returns:
+        The updated (config, params) with ``solver == EMULATOR``.
+    """
+    data = np.load(emulator_npz_path, allow_pickle=True)
+    names = tuple(str(name) for name in data["quantity_names"][:-1])
+    if names != tuple(chemistry_config.species_names):
+        raise ValueError(
+            f"emulator species {names} do not match the network's {chemistry_config.species_names}"
+        )
+    if not chemistry_config.thermochemistry:
+        raise ValueError("the emulator predicts the temperature: enable thermochemistry")
+    number_of_layers = int(data["n_layers"])
+    weights = tuple(jnp.asarray(data[f"W{i}"], dtype=jnp.float64) for i in range(number_of_layers))
+    biases = tuple(jnp.asarray(data[f"b{i}"], dtype=jnp.float64) for i in range(number_of_layers))
+    hydrogen, charge = zip(*(_species_hydrogen_and_charge(name) for name in names))
+    parsed = [_species_elements_and_charge(name)[0] for name in names]
+    elements = sorted({element for counts in parsed for element in counts})
+    element_matrix = np.array(
+        [[counts.get(element, 0) for element in elements] for counts in parsed], dtype=np.float64
+    )
+
+    config = chemistry_config._replace(
+        solver=EMULATOR,
+        emulator_activation=str(data["activation"]),
+        emulator_residual=bool(data["residual"]),
+        emulator_project_conservation=project_conservation,
+    )
+    params = chemistry_params._replace(
+        emulator_weights=weights,
+        emulator_biases=biases,
+        emulator_input_mean=jnp.asarray(data["input_mean"], dtype=jnp.float64),
+        emulator_input_std=jnp.asarray(data["input_std"], dtype=jnp.float64),
+        emulator_param_mean=float(data["param_mean"]),
+        emulator_param_std=float(data["param_std"]),
+        emulator_time_grid=jnp.asarray(data["time_grid_seconds"], dtype=jnp.float64),
+        emulator_hydrogen_atoms=jnp.asarray(hydrogen, dtype=jnp.float64),
+        emulator_charges=jnp.asarray(charge, dtype=jnp.float64),
+        emulator_element_matrix=jnp.asarray(element_matrix),
+    )
+    return config, params
