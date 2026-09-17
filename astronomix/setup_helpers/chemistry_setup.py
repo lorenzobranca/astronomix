@@ -247,11 +247,19 @@ def attach_emulator(
 ) -> Tuple[ChemistryConfig, ChemistryParams]:
     """Replace the stiff solve by a neural emulator exported to npz.
 
-    The npz (see ``emulator_dataset/export_fcnn_to_npz.py`` in the cloud-collision
-    project) holds the dense layers ``W<i>``/``b<i>``, the standardisation of the
-    17 quantities and of log10 nH, the time grid and the quantity names. The
-    species order must match the registered network's, and thermochemistry must
-    be on (the emulator returns the temperature).
+    The npz (see ``emulator_dataset/export_fcnn_to_npz.py`` and
+    ``export_multionet_to_npz.py`` in the cloud-collision project) holds the
+    standardisation of the 17 quantities and of log10 nH, the time grid, the
+    quantity names, the activation and residual flag, and the weights:
+
+    * ``architecture`` absent or ``"fcnn"``: dense layers ``W<i>``/``b<i>``
+      (``n_layers`` of them) on ``[state, tau, log10 nH]``;
+    * ``architecture == "multionet"``: branch layers ``branch_W<i>``/``branch_b<i>``
+      (``n_branch_layers``) on ``[state, log10 nH]`` and trunk layers
+      ``trunk_W<i>``/``trunk_b<i>`` (``n_trunk_layers``) on ``[tau]``.
+
+    The species order must match the registered network's, and thermochemistry
+    must be on (the emulator returns the temperature).
 
     Args:
         chemistry_config: Configuration built by ``build_chemistry_from_network_file``.
@@ -271,9 +279,29 @@ def attach_emulator(
         )
     if not chemistry_config.thermochemistry:
         raise ValueError("the emulator predicts the temperature: enable thermochemistry")
-    number_of_layers = int(data["n_layers"])
-    weights = tuple(jnp.asarray(data[f"W{i}"], dtype=jnp.float64) for i in range(number_of_layers))
-    biases = tuple(jnp.asarray(data[f"b{i}"], dtype=jnp.float64) for i in range(number_of_layers))
+    architecture = str(data["architecture"]) if "architecture" in data else "fcnn"
+
+    def layers(prefix, count_key):
+        count = int(data[count_key])
+        weights = tuple(jnp.asarray(data[f"{prefix}W{i}"], dtype=jnp.float64) for i in range(count))
+        biases = tuple(jnp.asarray(data[f"{prefix}b{i}"], dtype=jnp.float64) for i in range(count))
+        return weights, biases
+
+    n_quantities = len(names) + 1
+    if architecture == "fcnn":
+        weights, biases = layers("", "n_layers")
+        trunk_weights, trunk_biases = (), ()
+        if weights[0].shape[1] != n_quantities + 2 or weights[-1].shape[0] != n_quantities:
+            raise ValueError(f"fcnn layer shapes {[w.shape for w in weights]} do not fit {n_quantities} quantities")
+    elif architecture == "multionet":
+        weights, biases = layers("branch_", "n_branch_layers")
+        trunk_weights, trunk_biases = layers("trunk_", "n_trunk_layers")
+        if weights[0].shape[1] != n_quantities + 1 or trunk_weights[0].shape[1] != 1:
+            raise ValueError("multionet expects the branch net on [state, log10 nH] and the trunk net on [tau]")
+        if weights[-1].shape[0] != trunk_weights[-1].shape[0] or weights[-1].shape[0] < n_quantities:
+            raise ValueError("branch and trunk nets must emit the same number of outputs, at least one per quantity")
+    else:
+        raise ValueError(f"unknown emulator architecture {architecture!r}")
     hydrogen, charge = zip(*(_species_hydrogen_and_charge(name) for name in names))
     parsed = [_species_elements_and_charge(name)[0] for name in names]
     elements = sorted({element for counts in parsed for element in counts})
@@ -283,13 +311,16 @@ def attach_emulator(
 
     config = chemistry_config._replace(
         solver=EMULATOR,
-        emulator_activation=str(data["activation"]),
+        emulator_architecture=architecture,
+        emulator_activation=str(data["activation"]).lower(),
         emulator_residual=bool(data["residual"]),
         emulator_project_conservation=project_conservation,
     )
     params = chemistry_params._replace(
         emulator_weights=weights,
         emulator_biases=biases,
+        emulator_trunk_weights=trunk_weights,
+        emulator_trunk_biases=trunk_biases,
         emulator_input_mean=jnp.asarray(data["input_mean"], dtype=jnp.float64),
         emulator_input_std=jnp.asarray(data["input_std"], dtype=jnp.float64),
         emulator_param_mean=float(data["param_mean"]),

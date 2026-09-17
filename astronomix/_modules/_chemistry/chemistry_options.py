@@ -95,6 +95,10 @@ class ChemistryConfig(NamedTuple):
     co_cooling: bool = False
     carbon_monoxide_index: int = -1
     # --- neural emulator (solver == EMULATOR) ---
+    # "fcnn": one dense network on [state, tau, log10 nH] (CODES FullyConnected).
+    # "multionet": a branch net on [state, log10 nH] and a trunk net on [tau] whose
+    # outputs are split per quantity and dotted (CODES MultiONet).
+    emulator_architecture: str = "fcnn"
     emulator_activation: str = "softplus"
     emulator_residual: bool = True
     # After the emulator step, rescale the H-bearing species to the cell's
@@ -194,8 +198,12 @@ class ChemistryParams(NamedTuple):
     co_cooling_bounds: jnp.ndarray = jnp.array([])
     # --- neural emulator leaves (solver == EMULATOR); filled by attach_emulator ---
     # Dense layers W_i (out, in) and b_i, applied as act(W h + b); the last layer is linear.
+    # For the "fcnn" architecture this is the whole network; for "multionet" it is the
+    # branch net and the trunk net rides in the two leaves below.
     emulator_weights: Tuple[jnp.ndarray, ...] = ()
     emulator_biases: Tuple[jnp.ndarray, ...] = ()
+    emulator_trunk_weights: Tuple[jnp.ndarray, ...] = ()
+    emulator_trunk_biases: Tuple[jnp.ndarray, ...] = ()
     # Standardisation of the 17 quantities [log10 x_i (species), log10 T] and of log10 nH.
     emulator_input_mean: jnp.ndarray = jnp.array([])
     emulator_input_std: jnp.ndarray = jnp.array([])

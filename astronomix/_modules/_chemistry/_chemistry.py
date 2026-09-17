@@ -244,6 +244,75 @@ def _advance_single_cell(
     return final_state
 
 
+def _emulator_activation(name):
+    """The hidden-layer activation by its (lower-case) PyTorch name.
+
+    ``gelu`` is the exact erf form, as ``torch.nn.GELU()`` (JAX's default is the
+    tanh approximation, which differs at the 1e-3 level).
+    """
+    return {
+        "softplus": jax.nn.softplus,
+        "gelu": lambda x: jax.nn.gelu(x, approximate=False),
+        "silu": jax.nn.silu,
+        "relu": jax.nn.relu,
+        "tanh": jnp.tanh,
+    }[name]
+
+
+def _dense_stack(features, weights, biases, activation):
+    """``act(W h + b)`` through all but the last layer, which is linear."""
+    hidden = features
+    for weight, bias in zip(weights[:-1], biases[:-1]):
+        hidden = activation(weight @ hidden + bias)
+    return weights[-1] @ hidden + biases[-1]
+
+
+def _emulator_network(state, tau, parameter, chemistry_config, chemistry_params):
+    """Evaluate the emulator on one cell's standardised inputs.
+
+    Args:
+        state: Standardised ``[log10 x_i, log10 T]`` (``n_quantities``).
+        tau: Index fraction of the elapsed time on the model's time grid (scalar).
+        parameter: Standardised ``log10 n_H`` (scalar).
+
+    Returns:
+        The network output in standardised units (``n_quantities``), before the
+        residual skip.
+
+    ``fcnn``: one dense stack on ``concat(state, tau, parameter)`` (the CODES
+    ``FullyConnected`` input layout).
+
+    ``multionet``: the branch net on ``concat(state, parameter)`` and the trunk net
+    on ``tau`` each emit ``output_factor * n_quantities`` values, which are split
+    into ``n_quantities`` contiguous chunks (any remainder goes one-per-chunk to the
+    first chunks, as CODES does) and dotted chunk by chunk. The fixed parameter is
+    fed to the branch net (CODES ``params_branch=True``, the only layout exported).
+    """
+    p = chemistry_params
+    activation = _emulator_activation(chemistry_config.emulator_activation)
+    tau = jnp.reshape(tau, (1,))
+    parameter = jnp.reshape(parameter, (1,))
+    if chemistry_config.emulator_architecture == "fcnn":
+        features = jnp.concatenate([state, tau, parameter])
+        return _dense_stack(features, p.emulator_weights, p.emulator_biases, activation)
+    if chemistry_config.emulator_architecture == "multionet":
+        branch = _dense_stack(
+            jnp.concatenate([state, parameter]), p.emulator_weights, p.emulator_biases, activation
+        )
+        trunk = _dense_stack(tau, p.emulator_trunk_weights, p.emulator_trunk_biases, activation)
+        n_quantities = state.shape[0]
+        total = branch.shape[0]
+        base, remainder = divmod(total, n_quantities)  # static: shapes are known at trace time
+        sizes = [base + 1 if i < remainder else base for i in range(n_quantities)]
+        bounds = [0]
+        for size in sizes:
+            bounds.append(bounds[-1] + size)
+        return jnp.stack(
+            [jnp.dot(branch[lo:hi], trunk[lo:hi]) for lo, hi in zip(bounds[:-1], bounds[1:])]
+        )
+    raise ValueError(f"unknown emulator architecture {chemistry_config.emulator_architecture!r}")
+
+
 def _emulate_single_cell(
     cell_abundances,
     cell_temperature_kelvin,
@@ -253,12 +322,13 @@ def _emulate_single_cell(
 ):
     """Advance one cell with the neural emulator instead of the stiff solve.
 
-    Mirrors the operator the emulator was trained on (CODES FullyConnected /
-    FullyConnectedResidual on the cloud-collision carbox dataset): the input is
-    the standardised ``[log10 x_i, log10 T]`` with ``x_i = n_i / n_H,nuclei``, the
-    index fraction of the elapsed time on the model's time grid, and the
-    standardised ``log10 n_H``; the output is the standardised
-    ``[log10 x_i(t), log10 T(t)]`` (added to the input for the residual variant).
+    Mirrors the operator the emulator was trained on (a CODES ``FullyConnected`` /
+    ``FullyConnectedResidual`` or ``MultiONet`` / ``MultiONetResidual`` surrogate):
+    the input is the standardised ``[log10 x_i, log10 T]`` with
+    ``x_i = n_i / n_H,nuclei``, the index fraction of the elapsed time on the
+    model's time grid, and the standardised ``log10 n_H``; the output is the
+    standardised ``[log10 x_i(t), log10 T(t)]`` (added to the input for the
+    residual variants). See ``_emulator_network`` for the two architectures.
 
     Afterwards, optionally, the H-bearing species are rescaled to the cell's
     hydrogen-nuclei budget (which the hydro conserves and the emulator does not
@@ -296,20 +366,8 @@ def _emulate_single_cell(
     )
     parameter = (jnp.log10(hydrogen_nuclei) - p.emulator_param_mean) / p.emulator_param_std
     parameter = jnp.clip(parameter, -clip, clip) if clip > 0 else parameter
-    features = jnp.concatenate(
-        [network_input, jnp.reshape(tau, (1,)), jnp.reshape(parameter, (1,))]
-    )
 
-    activation = {
-        "softplus": jax.nn.softplus,
-        "gelu": jax.nn.gelu,
-        "silu": jax.nn.silu,
-        "relu": jax.nn.relu,
-    }[chemistry_config.emulator_activation]
-    hidden = features
-    for weight, bias in zip(p.emulator_weights[:-1], p.emulator_biases[:-1]):
-        hidden = activation(weight @ hidden + bias)
-    output = p.emulator_weights[-1] @ hidden + p.emulator_biases[-1]
+    output = _emulator_network(network_input, tau, parameter, chemistry_config, p)
     if chemistry_config.emulator_residual:
         output = output + standardised
 

@@ -215,10 +215,21 @@ params = SimulationParams(..., chemistry_params=chemistry_params)
 
 ### The neural chemistry emulator
 
-The per-cell operator `(species, T, dt) -> (species, T)` can be replaced by a trained dense
-network (a CODES `FullyConnected`/`FullyConnectedResidual` surrogate) exported to an `npz`
-(weights `W<i>`/`b<i>`, standardisation of the 17 quantities `[log10 x_i, log10 T]` and of
-`log10 n_H`, the time grid whose index fraction is the time input, the species order):
+The per-cell operator `(species, T, dt) -> (species, T)` can be replaced by a trained
+network exported to an `npz` holding the standardisation of the 17 quantities
+`[log10 x_i, log10 T]` and of `log10 n_H`, the time grid whose index fraction is the time
+input, the species order, the activation and residual flag, and the weights of one of two
+CODES architectures:
+
+- `FullyConnected` / `FullyConnectedResidual`: dense layers `W<i>`/`b<i>` on
+  `[state, tau, log10 n_H]` (`architecture` absent or `"fcnn"`);
+- `MultiONet` / `MultiONetResidual`: a branch net `branch_W<i>`/`branch_b<i>` on
+  `[state, log10 n_H]` and a trunk net `trunk_W<i>`/`trunk_b<i>` on `[tau]`, whose
+  outputs are split per quantity and dotted (`architecture = "multionet"`).
+
+The exporters live in the cloud-collision project (`export_fcnn_to_npz.py`,
+`export_multionet_to_npz.py`), and `verify_multionet_coupling.py` there checks the JAX
+path against the PyTorch model to float64 round-off:
 
 ```python
 from astronomix.setup_helpers.chemistry_setup import attach_emulator
