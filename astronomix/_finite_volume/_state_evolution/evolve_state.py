@@ -77,10 +77,24 @@ def _gravity_source_presolve(
     The source depends only on the pre-hydro state, so evaluating it before
     the hydro update and adding it afterwards reproduces the former
     ``_apply_self_gravity`` scheme exactly.
+
+    The state is sanitised first: a cell that is non-finite (a Riemann-solver
+    failure in the first half-step of an MHD step lands here before the
+    end-of-step backstop can reset it) enters the Poisson solve as a floored
+    rest cell instead. Without this a single bad cell poisons the FFT potential
+    and, through the momentum source, every cell of the grid within the same
+    step; the observed 256^3 failures (all 16.8M cells non-finite in one step
+    from ~100 bad cells) were exactly this. The bad cells themselves are left
+    untouched here and are repaired at the end of the step as before.
     """
+    cell_finite = jnp.all(jnp.isfinite(primitive_state), axis=0)
+    floored = jnp.zeros_like(primitive_state)
+    floored = floored.at[registered_variables.density_index].set(params.minimum_density)
+    floored = floored.at[registered_variables.pressure_index].set(params.minimum_pressure)
+    safe_state = jnp.where(cell_finite[None, ...], primitive_state, floored)
     return _time_integrator_sources(
         conserved_state_from_primitive(
-            primitive_state, gamma, config, registered_variables
+            safe_state, gamma, config, registered_variables
         ),
         None,
         None,

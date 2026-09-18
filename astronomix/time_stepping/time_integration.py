@@ -17,6 +17,7 @@ from typing import Any, NamedTuple, Union
 from types import NoneType
 
 # jax
+import os
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec
@@ -802,6 +803,22 @@ def _integrate_core(
                         )
                     )
 
+        if os.environ.get("ASTRONOMIX_STEP_DEBUG"):
+            # Per-step diagnostics for chasing blow-ups (host print; slow, debug only).
+            rho = primitive_state[registered_variables.density_index]
+            pressure = primitive_state[registered_variables.pressure_index]
+            speed = jnp.sqrt(
+                primitive_state[registered_variables.velocity_index.x] ** 2
+                + primitive_state[registered_variables.velocity_index.y] ** 2
+                + primitive_state[registered_variables.velocity_index.z] ** 2
+            )
+            jax.debug.print(
+                "STEPDBG t={t:.6f} dt={dt:.3e} chem_dt={c:.3e} rho[{rmin:.3e},{rmax:.3e}] "
+                "p[{pmin:.3e},{pmax:.3e}] vmax={v:.3e} nonfinite={nf}",
+                t=time + dt, dt=dt, c=(chemistry_dt if chemistry_dt is not None else dt),
+                rmin=jnp.min(rho), rmax=jnp.max(rho), pmin=jnp.min(pressure), pmax=jnp.max(pressure),
+                v=jnp.max(speed), nf=jnp.sum(~jnp.all(jnp.isfinite(primitive_state), axis=0)),
+            )
         return dt, LoopState(primitive_state, key, forcing, chemistry_clock)
 
     def _record_snapshot(time, state, store, idx):

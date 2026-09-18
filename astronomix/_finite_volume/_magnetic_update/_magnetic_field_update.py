@@ -14,6 +14,7 @@ from functools import partial
 from jaxtyping import Array, Float, jaxtyped
 
 # jax
+import os
 import jax
 import jax.numpy as jnp
 from jax.experimental import checkify
@@ -210,9 +211,16 @@ def magnetic_update(
     )
 
     if config.differentiation_mode == FORWARDS:
-        _, _, B_n, v_n, _, _ = jax.lax.while_loop(
+        _, _, B_n, v_n, final_iter, final_change = jax.lax.while_loop(
             while_condition, while_body, initial_state
         )
+        if os.environ.get("ASTRONOMIX_STEP_DEBUG"):
+            # Debug aid (host print): how the implicit eigen-iteration ended.
+            jax.debug.print(
+                "MHDITER iters={i} max_change={c:.3e} |B|max={b:.3e} |v|max={v:.3e} nonfinite_B={nb}",
+                i=final_iter, c=final_change, b=jnp.max(jnp.abs(B_n)), v=jnp.max(jnp.abs(v_n)),
+                nb=jnp.sum(~jnp.isfinite(B_n)),
+            )
     elif config.differentiation_mode == BACKWARDS:
         _, _, B_n, v_n, _, _ = checkpointed_while_loop(
             while_condition, while_body, initial_state, checkpoints=3
