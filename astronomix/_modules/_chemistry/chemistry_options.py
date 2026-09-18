@@ -110,6 +110,12 @@ class ChemistryConfig(NamedTuple):
     # chemistry step drove hundreds of dense cells non-finite), while the cells
     # below it react on the accumulated clock. 0 = no gate (every cell on the clock).
     chemistry_subcycle_density_threshold_cgs: float = 0.0
+    # With the density gate, apply the reaction in this many passes of dt/n per
+    # call (Lie splitting of the chemistry step itself). Lets the diffuse gas take
+    # an accumulated step longer than the emulator's training time grid (v3 ends
+    # at 3e11 s = 0.11 code units): e.g. a 0.18 code-unit accumulated step as two
+    # passes of 0.09. Dense cells pay the same n passes of their hydro dt / n.
+    chemistry_call_splits: int = 1
     # --- neural emulator (solver == EMULATOR) ---
     # "fcnn": one dense network on [state, tau, log10 nH] (CODES FullyConnected).
     # "multionet": a branch net on [state, log10 nH] and a trunk net on [tau] whose

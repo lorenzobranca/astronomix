@@ -621,17 +621,27 @@ def update_chemistry(
     # only bounds peak memory.
     chunk_size = chemistry_config.reaction_chunk_size
     if gated:
-        step_per_cell = time_step_seconds_per_cell.reshape(number_of_cells)
-        if 0 < chunk_size < number_of_cells:
-            reacted_per_cell = jax.lax.map(
-                lambda cell: react_one_cell(cell[0], cell[1], cell[2]),
-                (species_per_cell, temperature_per_cell, step_per_cell),
-                batch_size=chunk_size,
+        splits = max(int(chemistry_config.chemistry_call_splits), 1)
+        step_per_cell = time_step_seconds_per_cell.reshape(number_of_cells) / splits
+
+        def react_all(species_rows, temperature_rows):
+            if 0 < chunk_size < number_of_cells:
+                return jax.lax.map(
+                    lambda cell: react_one_cell(cell[0], cell[1], cell[2]),
+                    (species_rows, temperature_rows, step_per_cell),
+                    batch_size=chunk_size,
+                )
+            return jax.vmap(react_one_cell)(species_rows, temperature_rows, step_per_cell)
+
+        reacted_per_cell = react_all(species_per_cell, temperature_per_cell)
+        for _ in range(splits - 1):
+            # Further passes start from the previous pass's abundances and (with
+            # thermochemistry) temperature.
+            next_temperature = (
+                reacted_per_cell[:, number_of_species]
+                if chemistry_config.thermochemistry else temperature_per_cell
             )
-        else:
-            reacted_per_cell = jax.vmap(react_one_cell)(
-                species_per_cell, temperature_per_cell, step_per_cell
-            )
+            reacted_per_cell = react_all(reacted_per_cell[:, :number_of_species], next_temperature)
         # Cells whose step is zero this call keep their pre-reaction state (the
         # emulator is not defined at a zero step; the stiff solve would be a no-op).
         active_per_cell = cell_active.reshape(number_of_cells)
