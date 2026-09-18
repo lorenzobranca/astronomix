@@ -92,20 +92,37 @@ def _open_right_boundary(
 def _periodic_boundaries(
     primitive_state: STATE_TYPE, num_ghost_cells: int, axis: int
 ) -> STATE_TYPE:
-    """Wrap both ghost regions with a single scatter per side."""
-    ndim = primitive_state.ndim
+    """Wrap both ghost regions with the periodic image of the interior.
+
+    Expressed with ``jnp.roll`` + ``jnp.where`` rather than an ``.at[slice].set()``
+    scatter on ``axis``: a scatter whose destination slice lies on a *sharded*
+    axis cannot be resolved by the SPMD partitioner (jax raises a
+    ``ShardingTypeError``), whereas ``jnp.roll`` lowers to a collective-permute
+    and an elementwise ``where`` shards trivially, so this version runs unchanged
+    on one device and across a spatially-sharded mesh.
+
+    On the padded array (interior width ``N = n_total - 2*ng``) the periodic fill
+    is: left ghosts ← last ``ng`` interior cells, right ghosts ← first ``ng``
+    interior cells. Rolling the whole array by ``+2*ng`` brings the correct
+    values into the left-ghost region, and by ``-2*ng`` into the right-ghost
+    region; a positional mask along ``axis`` selects each region and leaves the
+    interior untouched.
+    """
     ng = num_ghost_cells
- 
-    # Left ghosts ← last ``ng`` interior cells  (state[..., :ng] = state[..., -2*ng:-ng])
-    left_dst = _axis_slice(axis, 0, ng, ndim)
-    left_src = _axis_slice(axis, -2 * ng, -ng, ndim)
-    primitive_state = primitive_state.at[left_dst].set(primitive_state[left_src])
- 
-    # Right ghosts ← first ``ng`` interior cells  (state[..., -ng:] = state[..., ng:2*ng])
-    right_dst = _axis_slice(axis, -ng, None, ndim)
-    right_src = _axis_slice(axis, ng, 2 * ng, ndim)
-    primitive_state = primitive_state.at[right_dst].set(primitive_state[right_src])
- 
+    n_total = primitive_state.shape[axis]
+
+    # Positional index along ``axis`` only, broadcast over the other axes.
+    index_shape = [1] * primitive_state.ndim
+    index_shape[axis] = n_total
+    axis_index = jnp.arange(n_total).reshape(index_shape)
+
+    left_wrapped = jnp.roll(primitive_state, 2 * ng, axis=axis)
+    right_wrapped = jnp.roll(primitive_state, -2 * ng, axis=axis)
+
+    primitive_state = jnp.where(axis_index < ng, left_wrapped, primitive_state)
+    primitive_state = jnp.where(
+        axis_index >= n_total - ng, right_wrapped, primitive_state
+    )
     return primitive_state
  
  

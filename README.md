@@ -21,6 +21,7 @@ finite volume approach of [Pang and Wu (2024)](https://arxiv.org/abs/2410.05173)
 - [x] backwards and forwards differentiable with adaptive timestepping
 - [x] turbulent driving, simple stellar wind, simple radiative cooling modules
 - [x] easily extensible, all code is open source
+- [x] **(this fork)** stiff astrochemistry + thermochemistry per cell via [carbox](https://github.com/lorenzobranca/carbox) reaction networks (Diffrax Kvaerno5, chunked, sharded), and a **neural chemistry emulator** that replaces the stiff solve with a trained dense network (~45x lower wall time at 160^3), see [Chemistry and the neural emulator](#chemistry-and-the-neural-chemistry-emulator-this-fork)
 
 ## Contents
 
@@ -28,6 +29,7 @@ finite volume approach of [Pang and Wu (2024)](https://arxiv.org/abs/2410.05173)
 - [Hello World! Your first astronomix simulation](#hello-world-your-first-astronomix-simulation)
 - [Notebooks for Getting Started](#notebooks-for-getting-started)
 - [Showcase](#showcase)
+- [Chemistry and the neural chemistry emulator (this fork)](#chemistry-and-the-neural-chemistry-emulator-this-fork)
 - [Scaling tests](#scaling-tests)
 - [Documentation](#documentation)
 - [Methodology](#methodology)
@@ -154,6 +156,106 @@ the notebooks below and we have also prepared a more advanced use-case
 |:---------------------------------------------------------------------------------:|
 | Wind Parameter Optimization                                                       |
 
+## Chemistry and the neural chemistry emulator (this fork)
+
+This fork (`lorenzobranca/astronomix`, branch `feature/multi-gpu-sharding`) adds a
+chemistry module to the finite-volume solver and the multi-GPU plumbing it needs.
+It was developed for a molecular-cloud-collision ground truth with MHD + self-gravity +
+stiff chemistry; the design notes and every measured number live in that project's
+`CONTEXT.md`.
+
+### Stiff chemistry and thermochemistry
+
+- A [carbox](https://github.com/lorenzobranca/carbox) reaction network is registered as a
+  contiguous block of species number densities in the state array
+  (`ChemistryConfig`/`ChemistryParams` in `astronomix/_modules/_chemistry/`).
+- Every hydro step, `update_chemistry` advances each cell with Diffrax `Kvaerno5` (vmapped,
+  optionally in sequential chunks via `reaction_chunk_size` to bound memory). With
+  `thermochemistry=True` the temperature is integrated alongside the species (heating:
+  cosmic rays, H2 formation; cooling: Glover & Abel H2, [C II], [O I], optional
+  Neufeld & Kaufman CO table) and written back to the pressure.
+- Setup in one call:
+
+```python
+from astronomix.setup_helpers import build_chemistry_from_network_file
+
+chemistry_config, chemistry_params, species_names = build_chemistry_from_network_file(
+    "network.csv", "latent_tgas",
+    number_density_unit_cgs=..., temperature_unit_kelvin=..., time_unit_seconds=...,
+    cosmic_ray_rate=3e-17, fuv_field=1e-4, visual_extinction=2.0,
+    thermochemistry=True, reaction_chunk_size=131072,
+    absolute_tolerance=1e-12, relative_tolerance=1e-6, max_steps=512,
+)
+config = SimulationConfig(..., chemistry_config=chemistry_config)
+params = SimulationParams(..., chemistry_params=chemistry_params)
+```
+
+- `ChemistryParams.cooling_courant` clips the per-step fractional temperature change of the
+  thermochemistry. **Do not use it as a stabiliser**: it silently sets the thermal state of the
+  whole cloud (dense gas parked at hundreds of K, dt-dependent). Set it to a large value
+  (e.g. 10) once the CFL estimate is nan-safe (below), which is what made it unnecessary.
+
+### Multi-GPU (sharded) finite volume
+
+- Pass a `NamedSharding` of the state (X axis split) to `time_integration`; the FV stencils run
+  inside a `shard_map` with rolls turned into halo exchanges (`_finite_volume/_sharding.py`).
+- The MHD magnetic update's eigen-iteration reduces its convergence test across devices
+  (`distributed_max`); without it the devices disagree on the trip count and deadlock in
+  `kCollectivePermute`.
+- On some nodes NCCL's NVLS multicast fails: set `NCCL_NVLS_ENABLE=0`.
+
+### Robustness of the coupled run
+
+- The FV CFL estimate ignores non-finite per-cell wave speeds and guards the final `dt`; before
+  that, one cell with a negative/non-finite pressure made the global timestep nan and the
+  whole grid was floored by the nan backstop in the next step.
+- The thermochemistry nan backstop resets any non-finite cell to a floored rest state and
+  prints `NANREPAIR bad_cells=N` when it fires (a steady trickle is local; a jump to the grid
+  size is global).
+
+### The neural chemistry emulator
+
+The per-cell operator `(species, T, dt) -> (species, T)` can be replaced by a trained
+network exported to an `npz` holding the standardisation of the 17 quantities
+`[log10 x_i, log10 T]` and of `log10 n_H`, the time grid whose index fraction is the time
+input, the species order, the activation and residual flag, and the weights of one of two
+CODES architectures:
+
+- `FullyConnected` / `FullyConnectedResidual`: dense layers `W<i>`/`b<i>` on
+  `[state, tau, log10 n_H]` (`architecture` absent or `"fcnn"`);
+- `MultiONet` / `MultiONetResidual`: a branch net `branch_W<i>`/`branch_b<i>` on
+  `[state, log10 n_H]` and a trunk net `trunk_W<i>`/`trunk_b<i>` on `[tau]`, whose
+  outputs are split per quantity and dotted (`architecture = "multionet"`).
+
+The exporters live in the cloud-collision project (`export_fcnn_to_npz.py`,
+`export_multionet_to_npz.py`), and `verify_multionet_coupling.py` there checks the JAX
+path against the PyTorch model to float64 round-off:
+
+```python
+from astronomix.setup_helpers.chemistry_setup import attach_emulator
+
+chemistry_config, chemistry_params = attach_emulator(
+    chemistry_config, chemistry_params, "fcresidual.npz", project_conservation=True,
+)
+```
+
+`update_chemistry` then dispatches to `_emulate_single_cell` under the same vmap/chunking/
+writeback. Because an unbounded regressor drifts where it was not trained, the step is
+guarded: every element is conserved per cell by rescaling its species to the budget the cell
+entered with, electrons are reset to charge neutrality, the standardised inputs are clipped
+to `emulator_input_clip_sigma` (5) and the temperature change per step is capped
+(`emulator_max_log_temperature_change`, 3 dex). Without the element projection a run
+diverged after ~400 steps from C/O species running away in a few void cells.
+
+Measured at 160^3 (MHD + gravity + 16-species carbox network, 3.65 Myr, ~400 steps), warm-
+started from one stiff segment: peak density within 1% of the stiff reference at every
+segment, final density field within 1.3% (rel. L2), temperature field median difference
+4e-5, H/H2 fractions within 5%, at 48x lower wall time (the run becomes hydro-bound).
+Two caveats: the emulator must have been trained on the compositions the run visits
+(a model trained on evolved states only could not start from a freshly seeded initial
+condition and drifted in chemical age), and the first step from a pristine seed is still
+best done with the stiff solver (`--restart` from a one-segment stiff checkpoint).
+
 ## Performance
 
 Methods paper incoming :)
@@ -182,6 +284,14 @@ First of all check if the initial conditions are valid. Then there
 is the `PositivityConfig` in the `SimulationConfig`, in which for instance
 a positivity preserving limiter can be turned on for the finite 
 difference scheme.
+
+### The chemistry emulator run drifts away from the stiff reference. Why?
+
+Check the emulator was trained on the states your run actually visits (density,
+temperature AND chemical composition/age): an off-manifold input is answered with an
+arbitrary output, and in an autoregressive run one such step is enough. Keep
+`project_conservation=True`. Warm-start from a short stiff integration when the initial
+composition is a synthetic seed.
 
 ## Documentation
 
