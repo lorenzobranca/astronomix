@@ -165,21 +165,35 @@ def _iteration_level_updates(
         # reaction, or 0 on the steps where the chemistry is skipped entirely.
         fv_sharding = get_active_fv_sharding()
 
-        def _react(state, dt_react):
+        def _react(state, dt_react, accumulated=None):
             if fv_sharding is not None:
                 # dt and params are passed as replicated shard_map arguments (not
                 # closed over: explicit-mesh mode forbids capturing sharded inputs).
+                if accumulated is None:
+                    return run_in_shard_map(
+                        lambda local_state, dt_local, params_local: update_chemistry(
+                            local_state,
+                            registered_variables,
+                            config.chemistry_config,
+                            params_local,
+                            dt_local,
+                        ),
+                        state,
+                        fv_sharding,
+                        replicated_args=(dt_react, params),
+                    )
                 return run_in_shard_map(
-                    lambda local_state, dt_local, params_local: update_chemistry(
+                    lambda local_state, dt_local, params_local, acc_local: update_chemistry(
                         local_state,
                         registered_variables,
                         config.chemistry_config,
                         params_local,
                         dt_local,
+                        acc_local,
                     ),
                     state,
                     fv_sharding,
-                    replicated_args=(dt_react, params),
+                    replicated_args=(dt_react, params, accumulated),
                 )
             return update_chemistry(
                 state,
@@ -187,10 +201,15 @@ def _iteration_level_updates(
                 config.chemistry_config,
                 params,
                 dt_react,
+                accumulated,
             )
 
         if chemistry_dt is None:
             primitive_state = _react(primitive_state, dt)
+        elif config.chemistry_config.chemistry_subcycle_density_threshold_cgs > 0.0:
+            # Density-gated sub-cycling: every step, dense cells take the hydro
+            # step and the rest take the accumulated clock (0 = skip).
+            primitive_state = _react(primitive_state, dt, accumulated=chemistry_dt)
         else:
             primitive_state = jax.lax.cond(
                 chemistry_dt > 0.0,

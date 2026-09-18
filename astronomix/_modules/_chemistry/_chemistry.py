@@ -437,8 +437,16 @@ def update_chemistry(
     chemistry_config: ChemistryConfig,
     simulation_params: SimulationParams,
     time_step: float,
+    accumulated_time_step=None,
 ) -> STATE_TYPE:
     """React the chemical species of the primitive state for one time step.
+
+    With ``accumulated_time_step`` given (chemistry sub-cycling with a density
+    gate, see ``ChemistryConfig.chemistry_subcycle_density_threshold_cgs``) the
+    step is per cell: cells at or above the density threshold advance by
+    ``time_step`` (the hydro step), the others by ``accumulated_time_step`` (the
+    hydro time since the last reaction, 0 on the steps where the clock is not
+    due); cells with a zero step keep their state.
 
     Reads the species block and the local temperature, integrates the reaction
     network in every cell over ``time_step`` and writes the updated species
@@ -516,6 +524,17 @@ def update_chemistry(
     )
 
     time_step_seconds = time_step * chemistry_params.time_unit_seconds
+    gated = accumulated_time_step is not None
+    if gated:
+        hydrogen_nuclei_density = (
+            density
+            * chemistry_params.number_density_unit_cgs
+            * chemistry_params.hydrogen_mass_fraction
+        )
+        dense = hydrogen_nuclei_density >= chemistry_config.chemistry_subcycle_density_threshold_cgs
+        time_step_per_cell = jnp.where(dense, time_step, accumulated_time_step)
+        cell_active = time_step_per_cell > 0.0
+        time_step_seconds_per_cell = time_step_per_cell * chemistry_params.time_unit_seconds
 
     # The species block holds code-unit number densities; the network works in
     # absolute number densities [cm^-3].
@@ -549,17 +568,20 @@ def update_chemistry(
 
     # Bind everything that is shared across cells; vmap only over the per-cell
     # abundances and temperature.
+    # With the density gate the step varies per cell and is vmapped over as a
+    # third array; otherwise it is bound once (the original, bit-identical path).
+    bound_step = {} if gated else {"time_step_seconds": time_step_seconds}
     if chemistry_config.solver == EMULATOR:
         react_one_cell = partial(
             _emulate_single_cell,
-            time_step_seconds=time_step_seconds,
             chemistry_config=chemistry_config,
             chemistry_params=chemistry_params,
+            **bound_step,
         )
     else:
         react_one_cell = partial(
             _advance_single_cell,
-            time_step_seconds=time_step_seconds,
+            **bound_step,
             reaction_network=reaction_network,
             rate_modifier_a=chemistry_params.rate_modifier_a,
             rate_modifier_b=chemistry_params.rate_modifier_b,
@@ -598,7 +620,26 @@ def update_chemistry(
     # independent, so this is numerically identical to the unchunked vmap and
     # only bounds peak memory.
     chunk_size = chemistry_config.reaction_chunk_size
-    if 0 < chunk_size < number_of_cells:
+    if gated:
+        step_per_cell = time_step_seconds_per_cell.reshape(number_of_cells)
+        if 0 < chunk_size < number_of_cells:
+            reacted_per_cell = jax.lax.map(
+                lambda cell: react_one_cell(cell[0], cell[1], cell[2]),
+                (species_per_cell, temperature_per_cell, step_per_cell),
+                batch_size=chunk_size,
+            )
+        else:
+            reacted_per_cell = jax.vmap(react_one_cell)(
+                species_per_cell, temperature_per_cell, step_per_cell
+            )
+        # Cells whose step is zero this call keep their pre-reaction state (the
+        # emulator is not defined at a zero step; the stiff solve would be a no-op).
+        active_per_cell = cell_active.reshape(number_of_cells)
+        unreacted = jnp.concatenate(
+            [species_per_cell, temperature_per_cell[:, None]], axis=1
+        )[:, : reacted_per_cell.shape[1]]
+        reacted_per_cell = jnp.where(active_per_cell[:, None], reacted_per_cell, unreacted)
+    elif 0 < chunk_size < number_of_cells:
         reacted_per_cell = jax.lax.map(
             lambda cell: react_one_cell(cell[0], cell[1]),
             (species_per_cell, temperature_per_cell),

@@ -104,6 +104,12 @@ class ChemistryConfig(NamedTuple):
     # than with the elapsed time, and to give a fine-CFL run the chemistry step of
     # a coarser one (e.g. 0.1 code units, the validated 160^3 dt_max, at 256^3).
     chemistry_step_target: float = 0.0
+    # Density gate for the sub-cycling: cells at or above this hydrogen nuclei
+    # density [cm^-3] react EVERY hydro step with the hydro dt (their cooling time
+    # is short and the hydro cannot take a long chemistry step: at 256^3 a 2-3 step
+    # chemistry step drove hundreds of dense cells non-finite), while the cells
+    # below it react on the accumulated clock. 0 = no gate (every cell on the clock).
+    chemistry_subcycle_density_threshold_cgs: float = 0.0
     # --- neural emulator (solver == EMULATOR) ---
     # "fcnn": one dense network on [state, tau, log10 nH] (CODES FullyConnected).
     # "multionet": a branch net on [state, log10 nH] and a trunk net on [tau] whose
