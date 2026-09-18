@@ -67,6 +67,7 @@ def _iteration_level_updates(
     helper_data: HelperData,
     registered_variables: RegisteredVariables,
     current_time: Union[float, Float[Array, ""]],
+    chemistry_dt=None,
 ) -> STATE_TYPE:
     """
     Apply the updates that run once before each hydro iteration.
@@ -159,29 +160,43 @@ def _iteration_level_updates(
         # all-gather that also confuses diffrax's closure conversion) and gives a
         # near-linear speed-up on the dominant cost. On one device it is a plain
         # call.
+        # With chemistry sub-cycling (``chemistry_step_target`` > 0) the caller
+        # passes ``chemistry_dt``: the hydro time accumulated since the last
+        # reaction, or 0 on the steps where the chemistry is skipped entirely.
         fv_sharding = get_active_fv_sharding()
-        if fv_sharding is not None:
-            # dt and params are passed as replicated shard_map arguments (not
-            # closed over: explicit-mesh mode forbids capturing sharded inputs).
-            primitive_state = run_in_shard_map(
-                lambda local_state, dt_local, params_local: update_chemistry(
-                    local_state,
-                    registered_variables,
-                    config.chemistry_config,
-                    params_local,
-                    dt_local,
-                ),
-                primitive_state,
-                fv_sharding,
-                replicated_args=(dt, params),
-            )
-        else:
-            primitive_state = update_chemistry(
-                primitive_state,
+
+        def _react(state, dt_react):
+            if fv_sharding is not None:
+                # dt and params are passed as replicated shard_map arguments (not
+                # closed over: explicit-mesh mode forbids capturing sharded inputs).
+                return run_in_shard_map(
+                    lambda local_state, dt_local, params_local: update_chemistry(
+                        local_state,
+                        registered_variables,
+                        config.chemistry_config,
+                        params_local,
+                        dt_local,
+                    ),
+                    state,
+                    fv_sharding,
+                    replicated_args=(dt_react, params),
+                )
+            return update_chemistry(
+                state,
                 registered_variables,
                 config.chemistry_config,
                 params,
-                dt,
+                dt_react,
+            )
+
+        if chemistry_dt is None:
+            primitive_state = _react(primitive_state, dt)
+        else:
+            primitive_state = jax.lax.cond(
+                chemistry_dt > 0.0,
+                lambda state: _react(state, chemistry_dt),
+                lambda state: state,
+                primitive_state,
             )
 
     # Neural-network body force.

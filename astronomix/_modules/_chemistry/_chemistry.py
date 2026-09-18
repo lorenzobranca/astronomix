@@ -407,6 +407,24 @@ def _emulate_single_cell(
             electrons = jnp.maximum(jnp.dot(charges, new_abundances), 1e-30)
             new_abundances = new_abundances.at[electron].set(electrons)
 
+    # Training-domain guard: outside the (n_H, T) range the emulator was trained on
+    # (plus a margin) the network extrapolates, and an extrapolating emulator has
+    # been seen to heat density-floor void cells to >1e5 K within one segment and
+    # take the whole grid down through the gravity solve. Such cells keep their
+    # pre-reaction state; they are voids of negligible mass whose chemistry is
+    # frozen anyway on the hydro time scale.
+    margin = chemistry_config.emulator_domain_margin_dex
+    if margin >= 0 and p.emulator_domain_log_nh.shape[0] == 2 and p.emulator_domain_log_t.shape[0] == 2:
+        log_nh = jnp.log10(hydrogen_nuclei)
+        inside = (
+            (log_nh >= p.emulator_domain_log_nh[0] - margin)
+            & (log_nh <= p.emulator_domain_log_nh[1] + margin)
+            & (log_temperature >= p.emulator_domain_log_t[0] - margin)
+            & (log_temperature <= p.emulator_domain_log_t[1] + margin)
+        )
+        new_abundances = jnp.where(inside, new_abundances, cell_abundances)
+        new_temperature = jnp.where(inside, new_temperature, cell_temperature_kelvin)
+
     new_abundances = jnp.where(jnp.isfinite(new_abundances), new_abundances, cell_abundances)
     new_temperature = jnp.where(jnp.isfinite(new_temperature), new_temperature, cell_temperature_kelvin)
     return jnp.concatenate([new_abundances, jnp.reshape(new_temperature, (1,))])

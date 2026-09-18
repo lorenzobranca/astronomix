@@ -94,6 +94,16 @@ class ChemistryConfig(NamedTuple):
     ionized_carbon_index: int = -1
     co_cooling: bool = False
     carbon_monoxide_index: int = -1
+    # Chemistry sub-cycling: react only once the hydro time accumulated since the
+    # last reaction reaches this many code time units (and at the end of every
+    # integration call), so the per-cell operator takes one long step instead of
+    # several short ones. 0 = react every hydro step (Lie-Trotter as before). The
+    # accumulated dt is what the operator (stiff solve or emulator) is asked to
+    # advance; the species are advected by the hydro in between as usual. Meant
+    # for the emulator, whose rollout error grows with the number of calls rather
+    # than with the elapsed time, and to give a fine-CFL run the chemistry step of
+    # a coarser one (e.g. 0.1 code units, the validated 160^3 dt_max, at 256^3).
+    chemistry_step_target: float = 0.0
     # --- neural emulator (solver == EMULATOR) ---
     # "fcnn": one dense network on [state, tau, log10 nH] (CODES FullyConnected).
     # "multionet": a branch net on [state, log10 nH] and a trunk net on [tau] whose
@@ -114,6 +124,11 @@ class ChemistryConfig(NamedTuple):
     emulator_input_clip_sigma: float = 5.0
     emulator_max_log_change: float = 0.0
     emulator_max_log_temperature_change: float = 3.0
+    # Training-domain guard: a cell whose log10 n_H or log10 T lies more than this
+    # many dex outside the range the emulator was trained on (emulator_domain_* in
+    # the params, written by the exporter from the training set) is left unchanged
+    # instead of being extrapolated. Negative = guard off.
+    emulator_domain_margin_dex: float = 0.1
 
 
 class ChemistryParams(NamedTuple):
@@ -217,3 +232,6 @@ class ChemistryParams(NamedTuple):
     # Atoms of each element per species, shape (species, elements); every element is
     # conserved per cell by rescaling its species after the emulator step.
     emulator_element_matrix: jnp.ndarray = jnp.array([])
+    # [min, max] of log10 n_H and log10 T in the training set (empty = unknown, guard off).
+    emulator_domain_log_nh: jnp.ndarray = jnp.array([])
+    emulator_domain_log_t: jnp.ndarray = jnp.array([])

@@ -258,8 +258,11 @@ def attach_emulator(
       (``n_branch_layers``) on ``[state, log10 nH]`` and trunk layers
       ``trunk_W<i>``/``trunk_b<i>`` (``n_trunk_layers``) on ``[tau]``.
 
-    The species order must match the registered network's, and thermochemistry
-    must be on (the emulator returns the temperature).
+    Optional ``domain_log_nh`` / ``domain_log_t`` ([min, max] of the training set)
+    enable the training-domain guard (``emulator_domain_margin_dex``): cells outside
+    are left unchanged rather than extrapolated. The species order must match the
+    registered network's, and thermochemistry must be on (the emulator returns the
+    temperature).
 
     Args:
         chemistry_config: Configuration built by ``build_chemistry_from_network_file``.
@@ -329,5 +332,11 @@ def attach_emulator(
         emulator_hydrogen_atoms=jnp.asarray(hydrogen, dtype=jnp.float64),
         emulator_charges=jnp.asarray(charge, dtype=jnp.float64),
         emulator_element_matrix=jnp.asarray(element_matrix),
+        emulator_domain_log_nh=(
+            jnp.asarray(data["domain_log_nh"], dtype=jnp.float64) if "domain_log_nh" in data else jnp.array([])
+        ),
+        emulator_domain_log_t=(
+            jnp.asarray(data["domain_log_t"], dtype=jnp.float64) if "domain_log_t" in data else jnp.array([])
+        ),
     )
     return config, params

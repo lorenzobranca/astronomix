@@ -106,10 +106,14 @@ class LoopState(NamedTuple):
         key: The PRNG key advanced by stochastic per-step modules (forcing, ...).
         forcing: The persistent OU forcing field ``f`` (shape (3, nx, ny, nz)),
             or ``None`` when OU forcing is inactive.
+        chemistry_clock: Hydro time accumulated since the last chemistry
+            reaction (chemistry sub-cycling, ``chemistry_step_target`` > 0), or
+            ``None`` when the chemistry reacts every step.
     """
     primitive_state: Any
     key: Any
     forcing: Any = None
+    chemistry_clock: Any = None
 
 
 def _raise_with_time_integration_hint(error: Exception, config: SimulationConfig):
@@ -529,11 +533,24 @@ def _build_initial_loop_state(primitive_state, config, params, restart_state=Non
     active) needs a persistent solenoidal field; otherwise the forcing slot
     stays ``None`` and costs nothing in the carry.
     """
+    clock0 = _initial_chemistry_clock(config)
     if restart_state is not None:
-        return LoopState(primitive_state, restart_state.key, restart_state.forcing)
+        return LoopState(primitive_state, restart_state.key, restart_state.forcing, clock0)
 
     key0, forcing0 = _seed_key_and_forcing(config, params)
-    return LoopState(primitive_state, key0, forcing0)
+    return LoopState(primitive_state, key0, forcing0, clock0)
+
+
+def _initial_chemistry_clock(config: SimulationConfig):
+    """Zero accumulated chemistry time when sub-cycling is on, else ``None``.
+
+    Every integration call (segment) starts with an empty clock and flushes it on
+    its last step, so a segment boundary is always a reaction time and the saved
+    states carry no pending chemistry.
+    """
+    if config.chemistry_config.chemistry and config.chemistry_config.chemistry_step_target > 0.0:
+        return jnp.asarray(0.0)
+    return None
 
 
 def _integrate_core(
@@ -655,10 +672,24 @@ def _integrate_core(
         if config.exact_end_time and not config.use_specific_snapshot_timepoints:
             dt = jnp.minimum(dt, params.t_end - time)
 
+        # Chemistry sub-cycling: accumulate the hydro time and react only when
+        # the accumulated step reaches the target, or on the segment's last step
+        # (dt was clipped to t_end - time above, so time + dt lands on t_end).
+        chemistry_clock = state.chemistry_clock
+        chemistry_dt = None
+        if chemistry_clock is not None:
+            accumulated = chemistry_clock + dt
+            last_step = time + dt >= params.t_end * (1.0 - 1e-12)
+            react_now = jnp.logical_or(
+                accumulated >= config.chemistry_config.chemistry_step_target, last_step
+            )
+            chemistry_dt = jnp.where(react_now, accumulated, 0.0)
+            chemistry_clock = jnp.where(react_now, 0.0, accumulated)
+
         # modules that run every time step
         key, forcing, primitive_state = _iteration_level_updates(
             primitive_state, key, forcing, dt, config, params, helper_data_pad,
-            registered_variables, time + dt,
+            registered_variables, time + dt, chemistry_dt=chemistry_dt,
         )
 
         # evolve the state
@@ -771,7 +802,7 @@ def _integrate_core(
                         )
                     )
 
-        return dt, LoopState(primitive_state, key, forcing)
+        return dt, LoopState(primitive_state, key, forcing, chemistry_clock)
 
     def _record_snapshot(time, state, store, idx):
         """Record snapshot ``idx`` (the requested diagnostics)."""
@@ -1002,7 +1033,9 @@ def _run_segment(
     primitive_state = _prepare_padded_state(
         primitive_state, config, params, registered_variables
     )
-    initial_loop_state = LoopState(primitive_state, init_key, init_forcing)
+    initial_loop_state = LoopState(
+        primitive_state, init_key, init_forcing, _initial_chemistry_clock(config)
+    )
     t_final, loop_state, _, num_iterations = _integrate_core(
         config,
         params,
