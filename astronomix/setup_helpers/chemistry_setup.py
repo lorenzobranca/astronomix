@@ -244,6 +244,8 @@ def attach_emulator(
     chemistry_params: ChemistryParams,
     emulator_npz_path: str,
     project_conservation: bool = True,
+    dense_emulator_npz_path: str = None,
+    dense_threshold_cgs: float = 0.0,
 ) -> Tuple[ChemistryConfig, ChemistryParams]:
     """Replace the stiff solve by a neural emulator exported to npz.
 
@@ -270,41 +272,57 @@ def attach_emulator(
         emulator_npz_path: The exported model.
         project_conservation: Rescale H-bearing species to the hydrogen budget and
             reset electrons to neutrality after every emulator step.
+        dense_emulator_npz_path: Optional second exported model for the cells at or
+            above ``dense_threshold_cgs`` hydrogen nuclei per cm^3 (same species,
+            activation and residual flag; own standardisation, time grid and
+            domain). See ``ChemistryConfig.emulator_dense_threshold_cgs``.
+        dense_threshold_cgs: The density split [cm^-3]; required (> 0) with a dense
+            model.
 
     Returns:
         The updated (config, params) with ``solver == EMULATOR``.
     """
-    data = np.load(emulator_npz_path, allow_pickle=True)
-    names = tuple(str(name) for name in data["quantity_names"][:-1])
-    if names != tuple(chemistry_config.species_names):
-        raise ValueError(
-            f"emulator species {names} do not match the network's {chemistry_config.species_names}"
-        )
     if not chemistry_config.thermochemistry:
         raise ValueError("the emulator predicts the temperature: enable thermochemistry")
-    architecture = str(data["architecture"]) if "architecture" in data else "fcnn"
 
-    def layers(prefix, count_key):
-        count = int(data[count_key])
-        weights = tuple(jnp.asarray(data[f"{prefix}W{i}"], dtype=jnp.float64) for i in range(count))
-        biases = tuple(jnp.asarray(data[f"{prefix}b{i}"], dtype=jnp.float64) for i in range(count))
-        return weights, biases
+    def parse(path):
+        """Load one exported model; returns (data, architecture, weights, biases, trunk_w, trunk_b)."""
+        data = np.load(path, allow_pickle=True)
+        names = tuple(str(name) for name in data["quantity_names"][:-1])
+        if names != tuple(chemistry_config.species_names):
+            raise ValueError(
+                f"emulator species {names} do not match the network's {chemistry_config.species_names}"
+            )
+        architecture = str(data["architecture"]) if "architecture" in data else "fcnn"
 
-    n_quantities = len(names) + 1
-    if architecture == "fcnn":
-        weights, biases = layers("", "n_layers")
-        trunk_weights, trunk_biases = (), ()
-        if weights[0].shape[1] != n_quantities + 2 or weights[-1].shape[0] != n_quantities:
-            raise ValueError(f"fcnn layer shapes {[w.shape for w in weights]} do not fit {n_quantities} quantities")
-    elif architecture == "multionet":
-        weights, biases = layers("branch_", "n_branch_layers")
-        trunk_weights, trunk_biases = layers("trunk_", "n_trunk_layers")
-        if weights[0].shape[1] != n_quantities + 1 or trunk_weights[0].shape[1] != 1:
-            raise ValueError("multionet expects the branch net on [state, log10 nH] and the trunk net on [tau]")
-        if weights[-1].shape[0] != trunk_weights[-1].shape[0] or weights[-1].shape[0] < n_quantities:
-            raise ValueError("branch and trunk nets must emit the same number of outputs, at least one per quantity")
-    else:
-        raise ValueError(f"unknown emulator architecture {architecture!r}")
+        def layers(prefix, count_key):
+            count = int(data[count_key])
+            weights = tuple(jnp.asarray(data[f"{prefix}W{i}"], dtype=jnp.float64) for i in range(count))
+            biases = tuple(jnp.asarray(data[f"{prefix}b{i}"], dtype=jnp.float64) for i in range(count))
+            return weights, biases
+
+        n_quantities = len(names) + 1
+        if architecture == "fcnn":
+            weights, biases = layers("", "n_layers")
+            trunk_weights, trunk_biases = (), ()
+            if weights[0].shape[1] != n_quantities + 2 or weights[-1].shape[0] != n_quantities:
+                raise ValueError(f"fcnn layer shapes {[w.shape for w in weights]} do not fit {n_quantities} quantities")
+        elif architecture == "multionet":
+            weights, biases = layers("branch_", "n_branch_layers")
+            trunk_weights, trunk_biases = layers("trunk_", "n_trunk_layers")
+            if weights[0].shape[1] != n_quantities + 1 or trunk_weights[0].shape[1] != 1:
+                raise ValueError("multionet expects the branch net on [state, log10 nH] and the trunk net on [tau]")
+            if weights[-1].shape[0] != trunk_weights[-1].shape[0] or weights[-1].shape[0] < n_quantities:
+                raise ValueError("branch and trunk nets must emit the same number of outputs, at least one per quantity")
+        else:
+            raise ValueError(f"unknown emulator architecture {architecture!r}")
+        return data, architecture, weights, biases, trunk_weights, trunk_biases
+
+    def domain(data, key):
+        return jnp.asarray(data[key], dtype=jnp.float64) if key in data else jnp.array([])
+
+    data, architecture, weights, biases, trunk_weights, trunk_biases = parse(emulator_npz_path)
+    names = tuple(str(name) for name in data["quantity_names"][:-1])
     hydrogen, charge = zip(*(_species_hydrogen_and_charge(name) for name in names))
     parsed = [_species_elements_and_charge(name)[0] for name in names]
     elements = sorted({element for counts in parsed for element in counts})
@@ -332,11 +350,33 @@ def attach_emulator(
         emulator_hydrogen_atoms=jnp.asarray(hydrogen, dtype=jnp.float64),
         emulator_charges=jnp.asarray(charge, dtype=jnp.float64),
         emulator_element_matrix=jnp.asarray(element_matrix),
-        emulator_domain_log_nh=(
-            jnp.asarray(data["domain_log_nh"], dtype=jnp.float64) if "domain_log_nh" in data else jnp.array([])
-        ),
-        emulator_domain_log_t=(
-            jnp.asarray(data["domain_log_t"], dtype=jnp.float64) if "domain_log_t" in data else jnp.array([])
-        ),
+        emulator_domain_log_nh=domain(data, "domain_log_nh"),
+        emulator_domain_log_t=domain(data, "domain_log_t"),
+    )
+    if dense_emulator_npz_path is None:
+        return config, params
+    if not dense_threshold_cgs > 0:
+        raise ValueError("a dense-gas emulator needs dense_threshold_cgs > 0")
+    dense, dense_architecture, dense_weights, dense_biases, dense_trunk_w, dense_trunk_b = parse(
+        dense_emulator_npz_path
+    )
+    if str(dense["activation"]).lower() != config.emulator_activation or bool(dense["residual"]) != config.emulator_residual:
+        raise ValueError("the dense-gas emulator must share the main model's activation and residual flag")
+    config = config._replace(
+        emulator_dense_threshold_cgs=float(dense_threshold_cgs),
+        emulator_dense_architecture=dense_architecture,
+    )
+    params = params._replace(
+        emulator_dense_weights=dense_weights,
+        emulator_dense_biases=dense_biases,
+        emulator_dense_trunk_weights=dense_trunk_w,
+        emulator_dense_trunk_biases=dense_trunk_b,
+        emulator_dense_input_mean=jnp.asarray(dense["input_mean"], dtype=jnp.float64),
+        emulator_dense_input_std=jnp.asarray(dense["input_std"], dtype=jnp.float64),
+        emulator_dense_param_mean=float(dense["param_mean"]),
+        emulator_dense_param_std=float(dense["param_std"]),
+        emulator_dense_time_grid=jnp.asarray(dense["time_grid_seconds"], dtype=jnp.float64),
+        emulator_dense_domain_log_nh=domain(dense, "domain_log_nh"),
+        emulator_dense_domain_log_t=domain(dense, "domain_log_t"),
     )
     return config, params

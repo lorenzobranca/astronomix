@@ -313,7 +313,7 @@ def _emulator_network(state, tau, parameter, chemistry_config, chemistry_params)
     raise ValueError(f"unknown emulator architecture {chemistry_config.emulator_architecture!r}")
 
 
-def _emulate_single_cell(
+def _emulate_single_cell_with(
     cell_abundances,
     cell_temperature_kelvin,
     time_step_seconds,
@@ -428,6 +428,53 @@ def _emulate_single_cell(
     new_abundances = jnp.where(jnp.isfinite(new_abundances), new_abundances, cell_abundances)
     new_temperature = jnp.where(jnp.isfinite(new_temperature), new_temperature, cell_temperature_kelvin)
     return jnp.concatenate([new_abundances, jnp.reshape(new_temperature, (1,))])
+
+
+def _emulate_single_cell(
+    cell_abundances,
+    cell_temperature_kelvin,
+    time_step_seconds,
+    chemistry_config,
+    chemistry_params,
+):
+    """Advance one cell with the emulator, choosing the net by the cell's density.
+
+    With ``chemistry_config.emulator_dense_threshold_cgs`` <= 0 this is exactly
+    ``_emulate_single_cell_with`` on the main leaves. Otherwise the cell is also
+    advanced by the dense-gas leaves (``emulator_dense_*``, same activation and
+    residual flag, own standardisation, time grid and training domain) and the
+    result of the net matching the cell's hydrogen-nuclei density is kept. Both
+    nets run for every cell (a per-cell ``where``, which vmaps and shards like
+    everything else in the reaction step); the emulator is cheap next to the hydro.
+    """
+    diffuse = _emulate_single_cell_with(
+        cell_abundances, cell_temperature_kelvin, time_step_seconds, chemistry_config, chemistry_params
+    )
+    threshold = chemistry_config.emulator_dense_threshold_cgs
+    if threshold <= 0:
+        return diffuse
+    p = chemistry_params
+    dense_params = p._replace(
+        emulator_weights=p.emulator_dense_weights,
+        emulator_biases=p.emulator_dense_biases,
+        emulator_trunk_weights=p.emulator_dense_trunk_weights,
+        emulator_trunk_biases=p.emulator_dense_trunk_biases,
+        emulator_input_mean=p.emulator_dense_input_mean,
+        emulator_input_std=p.emulator_dense_input_std,
+        emulator_param_mean=p.emulator_dense_param_mean,
+        emulator_param_std=p.emulator_dense_param_std,
+        emulator_time_grid=p.emulator_dense_time_grid,
+        emulator_domain_log_nh=p.emulator_dense_domain_log_nh,
+        emulator_domain_log_t=p.emulator_dense_domain_log_t,
+    )
+    dense_config = chemistry_config._replace(
+        emulator_architecture=chemistry_config.emulator_dense_architecture
+    )
+    dense = _emulate_single_cell_with(
+        cell_abundances, cell_temperature_kelvin, time_step_seconds, dense_config, dense_params
+    )
+    hydrogen_nuclei = jnp.dot(p.emulator_hydrogen_atoms, cell_abundances)
+    return jnp.where(hydrogen_nuclei >= threshold, dense, diffuse)
 
 
 @partial(jax.jit, static_argnames=("chemistry_config", "registered_variables"))

@@ -141,6 +141,18 @@ class ChemistryConfig(NamedTuple):
     # the params, written by the exporter from the training set) is left unchanged
     # instead of being extrapolated. Negative = guard off.
     emulator_domain_margin_dex: float = 0.1
+    # --- second emulator for the dense gas (emulator_dense_threshold_cgs > 0) ---
+    # Cells at or above this hydrogen-nuclei density [cm^-3] are advanced by the
+    # "dense" emulator leaves (emulator_dense_* in the params, see
+    # ``attach_emulator(dense_emulator_npz_path=...)``) instead of the main ones.
+    # Both nets are evaluated for every cell and the result selected per cell, so
+    # the emulator costs two forward passes. Meant to pair a short-time-grid model
+    # that resolves a single hydro step in the cores (where the chemistry reacts
+    # every step) with a long-grid model for the gated diffuse gas: a model trained
+    # on a 1e13 s grid freezes at an 8e10 s call, one trained to 3e11 s cannot take
+    # the 1e12 s diffuse step (CONTEXT.md 2026-09-22). 0 = one emulator everywhere.
+    emulator_dense_threshold_cgs: float = 0.0
+    emulator_dense_architecture: str = "fcnn"
 
 
 class ChemistryParams(NamedTuple):
@@ -247,3 +259,16 @@ class ChemistryParams(NamedTuple):
     # [min, max] of log10 n_H and log10 T in the training set (empty = unknown, guard off).
     emulator_domain_log_nh: jnp.ndarray = jnp.array([])
     emulator_domain_log_t: jnp.ndarray = jnp.array([])
+    # Leaves of the optional dense-gas emulator (ChemistryConfig.emulator_dense_threshold_cgs
+    # > 0); same layout as the main leaves above. Activation and residual flag are shared.
+    emulator_dense_weights: Tuple[jnp.ndarray, ...] = ()
+    emulator_dense_biases: Tuple[jnp.ndarray, ...] = ()
+    emulator_dense_trunk_weights: Tuple[jnp.ndarray, ...] = ()
+    emulator_dense_trunk_biases: Tuple[jnp.ndarray, ...] = ()
+    emulator_dense_input_mean: jnp.ndarray = jnp.array([])
+    emulator_dense_input_std: jnp.ndarray = jnp.array([])
+    emulator_dense_param_mean: float = 0.0
+    emulator_dense_param_std: float = 1.0
+    emulator_dense_time_grid: jnp.ndarray = jnp.array([])
+    emulator_dense_domain_log_nh: jnp.ndarray = jnp.array([])
+    emulator_dense_domain_log_t: jnp.ndarray = jnp.array([])
