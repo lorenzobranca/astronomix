@@ -155,6 +155,13 @@ class ChemistryConfig(NamedTuple):
     emulator_dense_architecture: str = "fcnn"
     emulator_dense_activation: str = "softplus"
     emulator_dense_residual: bool = True
+    # Stiff-core hybrid (solver == EMULATOR with the density gate): the cells at or
+    # above chemistry_subcycle_density_threshold_cgs are advanced by the STIFF
+    # network solve instead of the emulator, up to this many cells per device per
+    # call (a fixed capacity keeps the gather/scatter jit-able; cells beyond it keep
+    # the emulator result). The cores are ~0.5% of a 256^3 grid, so exact core
+    # chemistry costs a small fraction of the full stiff run. 0 = off.
+    stiff_core_capacity: int = 0
 
 
 class ChemistryParams(NamedTuple):

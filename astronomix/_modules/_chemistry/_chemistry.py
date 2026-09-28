@@ -528,9 +528,10 @@ def update_chemistry(
     # reactions and so is not hashable.
     reaction_network = chemistry_params.network
 
-    if chemistry_config.solver == EMULATOR:
+    if chemistry_config.solver == EMULATOR and chemistry_config.stiff_core_capacity <= 0:
         solver = None  # no ODE solve: the neural emulator replaces it
-    elif chemistry_config.solver == KVAERNO5:
+    elif chemistry_config.solver == KVAERNO5 or chemistry_config.solver == EMULATOR:
+        # the stiff-core hybrid needs the stiff solver next to the emulator
         import diffrax as dx
 
         from ._sharding_compat import ensure_lineax_sharding_compatibility
@@ -620,6 +621,7 @@ def update_chemistry(
     # With the density gate the step varies per cell and is vmapped over as a
     # third array; otherwise it is bound once (the original, bit-identical path).
     bound_step = {} if gated else {"time_step_seconds": time_step_seconds}
+    stiff_kwargs = None
     if chemistry_config.solver == EMULATOR:
         react_one_cell = partial(
             _emulate_single_cell,
@@ -627,10 +629,8 @@ def update_chemistry(
             chemistry_params=chemistry_params,
             **bound_step,
         )
-    else:
-        react_one_cell = partial(
-            _advance_single_cell,
-            **bound_step,
+    if chemistry_config.solver != EMULATOR or chemistry_config.stiff_core_capacity > 0:
+        stiff_kwargs = dict(
             reaction_network=reaction_network,
             rate_modifier_a=chemistry_params.rate_modifier_a,
             rate_modifier_b=chemistry_params.rate_modifier_b,
@@ -659,6 +659,8 @@ def update_chemistry(
             co_cooling_table=chemistry_params.co_cooling_table,
             co_cooling_bounds=chemistry_params.co_cooling_bounds,
         )
+    if chemistry_config.solver != EMULATOR:
+        react_one_cell = partial(_advance_single_cell, **bound_step, **stiff_kwargs)
     # At full grid resolution a single ``vmap`` over every cell materialises the
     # stiff solver's per-cell working set for the whole grid at once, which is
     # the memory bottleneck (the state itself is small). When a chunk size is
@@ -698,6 +700,25 @@ def update_chemistry(
             [species_per_cell, temperature_per_cell[:, None]], axis=1
         )[:, : reacted_per_cell.shape[1]]
         reacted_per_cell = jnp.where(active_per_cell[:, None], reacted_per_cell, unreacted)
+        if chemistry_config.solver == EMULATOR and chemistry_config.stiff_core_capacity > 0:
+            # Stiff-core hybrid: re-solve the dense cells with the stiff network. A
+            # fixed-capacity gather keeps this jit-able: ``nonzero(size=K)`` pads
+            # with an out-of-range index, whose gather clips to the last cell and
+            # whose scatter is dropped, so padded slots never touch the state.
+            capacity = int(chemistry_config.stiff_core_capacity)
+            dense_flat = dense.reshape(number_of_cells)
+            core_index = jnp.nonzero(dense_flat, size=capacity, fill_value=number_of_cells)[0]
+            react_core = partial(_advance_single_cell, **stiff_kwargs)
+            core_cells = (
+                species_per_cell[core_index],
+                temperature_per_cell[core_index],
+                time_step_seconds_per_cell.reshape(number_of_cells)[core_index],
+            )
+            core_batch = chunk_size if 0 < chunk_size < capacity else capacity
+            core_reacted = jax.lax.map(
+                lambda cell: react_core(cell[0], cell[1], cell[2]), core_cells, batch_size=core_batch
+            )
+            reacted_per_cell = reacted_per_cell.at[core_index].set(core_reacted, mode="drop")
     elif 0 < chunk_size < number_of_cells:
         reacted_per_cell = jax.lax.map(
             lambda cell: react_one_cell(cell[0], cell[1]),
