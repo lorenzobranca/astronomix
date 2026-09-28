@@ -273,9 +273,9 @@ def attach_emulator(
         project_conservation: Rescale H-bearing species to the hydrogen budget and
             reset electrons to neutrality after every emulator step.
         dense_emulator_npz_path: Optional second exported model for the cells at or
-            above ``dense_threshold_cgs`` hydrogen nuclei per cm^3 (same species,
-            activation and residual flag; own standardisation, time grid and
-            domain). See ``ChemistryConfig.emulator_dense_threshold_cgs``.
+            above ``dense_threshold_cgs`` hydrogen nuclei per cm^3 (same species; its
+            own architecture, activation, residual flag, standardisation, time grid
+            and domain). See ``ChemistryConfig.emulator_dense_threshold_cgs``.
         dense_threshold_cgs: The density split [cm^-3]; required (> 0) with a dense
             model.
 
@@ -360,11 +360,11 @@ def attach_emulator(
     dense, dense_architecture, dense_weights, dense_biases, dense_trunk_w, dense_trunk_b = parse(
         dense_emulator_npz_path
     )
-    if str(dense["activation"]).lower() != config.emulator_activation or bool(dense["residual"]) != config.emulator_residual:
-        raise ValueError("the dense-gas emulator must share the main model's activation and residual flag")
     config = config._replace(
         emulator_dense_threshold_cgs=float(dense_threshold_cgs),
         emulator_dense_architecture=dense_architecture,
+        emulator_dense_activation=str(dense["activation"]).lower(),
+        emulator_dense_residual=bool(dense["residual"]),
     )
     params = params._replace(
         emulator_dense_weights=dense_weights,

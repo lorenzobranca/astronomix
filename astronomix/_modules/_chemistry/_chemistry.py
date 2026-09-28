@@ -441,8 +441,8 @@ def _emulate_single_cell(
 
     With ``chemistry_config.emulator_dense_threshold_cgs`` <= 0 this is exactly
     ``_emulate_single_cell_with`` on the main leaves. Otherwise the cell is also
-    advanced by the dense-gas leaves (``emulator_dense_*``, same activation and
-    residual flag, own standardisation, time grid and training domain) and the
+    advanced by the dense-gas leaves (``emulator_dense_*``, own architecture,
+    activation, residual flag, standardisation, time grid and training domain) and the
     result of the net matching the cell's hydrogen-nuclei density is kept. Both
     nets run for every cell (a per-cell ``where``, which vmaps and shards like
     everything else in the reaction step); the emulator is cheap next to the hydro.
@@ -468,7 +468,9 @@ def _emulate_single_cell(
         emulator_domain_log_t=p.emulator_dense_domain_log_t,
     )
     dense_config = chemistry_config._replace(
-        emulator_architecture=chemistry_config.emulator_dense_architecture
+        emulator_architecture=chemistry_config.emulator_dense_architecture,
+        emulator_activation=chemistry_config.emulator_dense_activation,
+        emulator_residual=chemistry_config.emulator_dense_residual,
     )
     dense = _emulate_single_cell_with(
         cell_abundances, cell_temperature_kelvin, time_step_seconds, dense_config, dense_params

@@ -153,6 +153,8 @@ class ChemistryConfig(NamedTuple):
     # the 1e12 s diffuse step (CONTEXT.md 2026-09-22). 0 = one emulator everywhere.
     emulator_dense_threshold_cgs: float = 0.0
     emulator_dense_architecture: str = "fcnn"
+    emulator_dense_activation: str = "softplus"
+    emulator_dense_residual: bool = True
 
 
 class ChemistryParams(NamedTuple):
