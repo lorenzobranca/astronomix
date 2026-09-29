@@ -582,6 +582,11 @@ def update_chemistry(
             * chemistry_params.hydrogen_mass_fraction
         )
         dense = hydrogen_nuclei_density >= chemistry_config.chemistry_subcycle_density_threshold_cgs
+        if chemistry_config.chemistry_subcycle_temperature_threshold_kelvin > 0:
+            dense = dense | (
+                temperature_kelvin
+                >= chemistry_config.chemistry_subcycle_temperature_threshold_kelvin
+            )
         time_step_per_cell = jnp.where(dense, time_step, accumulated_time_step)
         cell_active = time_step_per_cell > 0.0
         time_step_seconds_per_cell = time_step_per_cell * chemistry_params.time_unit_seconds

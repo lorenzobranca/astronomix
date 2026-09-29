@@ -110,6 +110,14 @@ class ChemistryConfig(NamedTuple):
     # chemistry step drove hundreds of dense cells non-finite), while the cells
     # below it react on the accumulated clock. 0 = no gate (every cell on the clock).
     chemistry_subcycle_density_threshold_cgs: float = 0.0
+    # Temperature gate (with the density gate): cells at or above this temperature
+    # [K] are treated like the dense cells - they react every hydro step, and in
+    # the stiff-core hybrid they are re-solved by the stiff network. Motivation
+    # (2026-09-29): behind the collision shock the void gas is heated to 1e3-1e4 K
+    # and must cool within a hydro step; on the accumulated clock the emulator
+    # under-cools it and the shocked void settles at ~2000 K instead of ~450 K.
+    # 0 = off.
+    chemistry_subcycle_temperature_threshold_kelvin: float = 0.0
     # With the density gate, apply the reaction in this many passes of dt/n per
     # call (Lie splitting of the chemistry step itself). Lets the diffuse gas take
     # an accumulated step longer than the emulator's training time grid (v3 ends
