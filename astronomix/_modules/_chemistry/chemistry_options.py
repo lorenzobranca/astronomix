@@ -170,6 +170,12 @@ class ChemistryConfig(NamedTuple):
     # the emulator result). The cores are ~0.5% of a 256^3 grid, so exact core
     # chemistry costs a small fraction of the full stiff run. 0 = off.
     stiff_core_capacity: int = 0
+    # With the stiff-core hybrid: also re-solve the cells OUTSIDE the emulator's
+    # training domain (which the domain guard would otherwise freeze) with the
+    # stiff network. 2026-09-29: the density-floor / shocked void carries 10-35% of
+    # the density hydrogen in its species, i.e. species n_H ~ 0.3-1 cm^-3, below the
+    # pool of every emulator; frozen, it never cools behind the collision shock.
+    stiff_outside_domain: bool = False
 
 
 class ChemistryParams(NamedTuple):

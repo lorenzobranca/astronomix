@@ -712,6 +712,15 @@ def update_chemistry(
             # whose scatter is dropped, so padded slots never touch the state.
             capacity = int(chemistry_config.stiff_core_capacity)
             dense_flat = dense.reshape(number_of_cells)
+            p_ = chemistry_params; margin_ = chemistry_config.emulator_domain_margin_dex
+            if (chemistry_config.stiff_outside_domain and margin_ >= 0
+                    and p_.emulator_domain_log_nh.shape[0] == 2 and p_.emulator_domain_log_t.shape[0] == 2):
+                # cells the emulator's domain guard would freeze: solve them stiffly instead
+                log_nh_ = jnp.log10(jnp.maximum(jnp.dot(species_per_cell, p_.emulator_hydrogen_atoms), 1e-30))
+                log_t_ = jnp.log10(jnp.maximum(temperature_per_cell, 1e-30))
+                inside_ = ((log_nh_ >= p_.emulator_domain_log_nh[0] - margin_) & (log_nh_ <= p_.emulator_domain_log_nh[1] + margin_)
+                           & (log_t_ >= p_.emulator_domain_log_t[0] - margin_) & (log_t_ <= p_.emulator_domain_log_t[1] + margin_))
+                dense_flat = dense_flat | (~inside_ & active_per_cell)
             core_index = jnp.nonzero(dense_flat, size=capacity, fill_value=number_of_cells)[0]
             react_core = partial(_advance_single_cell, **stiff_kwargs)
             core_cells = (
