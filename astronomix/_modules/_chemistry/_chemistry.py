@@ -228,6 +228,11 @@ def _advance_single_cell(
         ),
         saveat=dx.SaveAt(t1=True),
         max_steps=max_steps,
+        # Do not raise when a cell exhausts ``max_steps``: the guard below keeps
+        # that cell's pre-step state. With the default ``throw=True`` a single
+        # stiff cell aborts the whole run (seen in the hybrid run of 2026-10-06,
+        # where the T >= 300 K cells of the corrected network hit 512 steps).
+        throw=False,
     )
 
     # Only the end state matters for an operator-split sub-step. Guard against a
