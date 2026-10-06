@@ -37,6 +37,10 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 
 # astronomix functions
 from astronomix._modules._chemistry._chemistry import update_chemistry
+from astronomix._finite_volume._sharding import (
+    run_in_shard_map,
+    get_active_fv_sharding,
+)
 from astronomix._modules._cnn_mhd_corrector._cnn_mhd_corrector import _cnn_mhd_corrector
 from astronomix._modules._cooling._cooling import update_pressure_by_cooling
 from astronomix._modules._cosmic_rays.cr_injection import inject_crs_at_strongest_shock
@@ -63,6 +67,7 @@ def _iteration_level_updates(
     helper_data: HelperData,
     registered_variables: RegisteredVariables,
     current_time: Union[float, Float[Array, ""]],
+    chemistry_dt=None,
 ) -> STATE_TYPE:
     """
     Apply the updates that run once before each hydro iteration.
@@ -149,13 +154,69 @@ def _iteration_level_updates(
     # Astrochemistry. The species advect with the flow (handled by the solver);
     # here they are reacted per cell. Finite-volume only for now.
     if config.chemistry_config.chemistry and config.solver_mode == FINITE_VOLUME:
-        primitive_state = update_chemistry(
-            primitive_state,
-            registered_variables,
-            config.chemistry_config,
-            params,
-            dt,
-        )
+        # The per-cell reaction is embarrassingly parallel (no stencil). Under
+        # multi-GPU sharding run it inside a shard_map so each device reacts only
+        # its local slab: this avoids gathering the whole grid to one device (an
+        # all-gather that also confuses diffrax's closure conversion) and gives a
+        # near-linear speed-up on the dominant cost. On one device it is a plain
+        # call.
+        # With chemistry sub-cycling (``chemistry_step_target`` > 0) the caller
+        # passes ``chemistry_dt``: the hydro time accumulated since the last
+        # reaction, or 0 on the steps where the chemistry is skipped entirely.
+        fv_sharding = get_active_fv_sharding()
+
+        def _react(state, dt_react, accumulated=None):
+            if fv_sharding is not None:
+                # dt and params are passed as replicated shard_map arguments (not
+                # closed over: explicit-mesh mode forbids capturing sharded inputs).
+                if accumulated is None:
+                    return run_in_shard_map(
+                        lambda local_state, dt_local, params_local: update_chemistry(
+                            local_state,
+                            registered_variables,
+                            config.chemistry_config,
+                            params_local,
+                            dt_local,
+                        ),
+                        state,
+                        fv_sharding,
+                        replicated_args=(dt_react, params),
+                    )
+                return run_in_shard_map(
+                    lambda local_state, dt_local, params_local, acc_local: update_chemistry(
+                        local_state,
+                        registered_variables,
+                        config.chemistry_config,
+                        params_local,
+                        dt_local,
+                        acc_local,
+                    ),
+                    state,
+                    fv_sharding,
+                    replicated_args=(dt_react, params, accumulated),
+                )
+            return update_chemistry(
+                state,
+                registered_variables,
+                config.chemistry_config,
+                params,
+                dt_react,
+                accumulated,
+            )
+
+        if chemistry_dt is None:
+            primitive_state = _react(primitive_state, dt)
+        elif config.chemistry_config.chemistry_subcycle_density_threshold_cgs > 0.0:
+            # Density-gated sub-cycling: every step, dense cells take the hydro
+            # step and the rest take the accumulated clock (0 = skip).
+            primitive_state = _react(primitive_state, dt, accumulated=chemistry_dt)
+        else:
+            primitive_state = jax.lax.cond(
+                chemistry_dt > 0.0,
+                lambda state: _react(state, chemistry_dt),
+                lambda state: state,
+                primitive_state,
+            )
 
     # Neural-network body force.
     if config.neural_net_force_config.neural_net_force:

@@ -95,10 +95,14 @@ def _pad(state: STATE_TYPE, config: SimulationConfig) -> STATE_TYPE_ALTERED:
     """
     Surround the state with a ghost-cell halo on every spatial axis.
 
-    Pads ``num_ghost_cells`` cells onto both ends of each spatial axis using
-    edge replication, which gives a sensible default for the ghost cells before
-    the boundary handler fills them in. Axis 0 (the fluid variables) is left
-    unpadded.
+    Pads ``num_ghost_cells`` cells onto both ends of each spatial axis with
+    zeros (``mode="constant"``). The halo values are placeholders: the boundary
+    handler overwrites every ghost cell from the interior before they influence
+    any interior update, so the fill value does not affect results. Constant
+    padding is used rather than edge replication because edge replication slices
+    the array to width one, which JAX cannot do on a spatially sharded axis
+    (multi-GPU runs); constant padding shards cleanly. Axis 0 (the fluid
+    variables) is left unpadded.
 
     Args:
         state: The interior primitive state array (variables on axis 0, then one
@@ -107,13 +111,13 @@ def _pad(state: STATE_TYPE, config: SimulationConfig) -> STATE_TYPE_ALTERED:
             the number of ghost cells per side.
 
     Returns:
-        The primitive state padded with an edge-replicated ghost halo.
+        The primitive state padded with a zero-filled ghost halo.
     """
     if config.dimensionality == 1:
         state = jnp.pad(
             state,
             ((0, 0), (config.num_ghost_cells, config.num_ghost_cells)),
-            mode="edge",
+            mode="constant",
         )
 
     elif config.dimensionality == 2:
@@ -124,7 +128,7 @@ def _pad(state: STATE_TYPE, config: SimulationConfig) -> STATE_TYPE_ALTERED:
                 (config.num_ghost_cells, config.num_ghost_cells),
                 (config.num_ghost_cells, config.num_ghost_cells),
             ),
-            mode="edge",
+            mode="constant",
         )
 
     elif config.dimensionality == 3:
@@ -136,7 +140,7 @@ def _pad(state: STATE_TYPE, config: SimulationConfig) -> STATE_TYPE_ALTERED:
                 (config.num_ghost_cells, config.num_ghost_cells),
                 (config.num_ghost_cells, config.num_ghost_cells),
             ),
-            mode="edge",
+            mode="constant",
         )
 
     return state

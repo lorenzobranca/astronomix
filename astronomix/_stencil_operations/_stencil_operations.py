@@ -16,14 +16,23 @@ from jaxtyping import Array, Float, jaxtyped
 import jax
 import jax.numpy as jnp
 
-# @jaxtyped(typechecker=typechecker)
-@partial(jax.jit, static_argnames=["shift", "axis"])
+# astronomix (sharding-aware roll)
+from astronomix._finite_volume._sharding import distributed_roll
+
+
 def custom_roll(input_array: jnp.ndarray, shift: int, axis: int) -> jnp.ndarray:
     """Periodic roll of ``input_array`` by ``shift`` along ``axis``.
 
-    Equivalent to ``jnp.roll`` but expressed via two static slices and a
-    concatenate, which keeps ``shift`` / ``axis`` compile-time constants so the
-    stencil helpers built on top of it fuse cleanly.
+    Routes through :func:`distributed_roll`, which is a plain ``jnp.roll`` on a
+    single device (or an unsharded axis) and a ``ppermute``-based global roll when
+    the finite-volume step runs inside a ``shard_map`` and ``axis`` is the
+    spatially-sharded one. An earlier version used a slice+concatenate for fusion,
+    but that lowers to an all-gather on a sharded axis; the roll keeps the
+    single-device numerics identical while letting the stencils shard.
+
+    This helper is deliberately not ``jax.jit``-wrapped: it must be traced inline
+    so the active sharding context (a thread-local read at trace time) is honoured
+    rather than being fixed by a cached compilation.
 
     Args:
         input_array: The array to roll.
@@ -33,14 +42,7 @@ def custom_roll(input_array: jnp.ndarray, shift: int, axis: int) -> jnp.ndarray:
     Returns:
         The rolled array.
     """
-    i = (-shift) % input_array.shape[axis]
-    return jax.lax.concatenate(
-        [
-            jax.lax.slice_in_dim(input_array, i, input_array.shape[axis], axis=axis),
-            jax.lax.slice_in_dim(input_array, 0, i, axis=axis),
-        ],
-        dimension=axis,
-    )
+    return distributed_roll(input_array, shift, axis)
 
 
 def _shift(input_array: jnp.ndarray, shift: int, axis: int) -> jnp.ndarray:
@@ -52,8 +54,8 @@ def _shift(input_array: jnp.ndarray, shift: int, axis: int) -> jnp.ndarray:
     """
     return custom_roll(input_array, shift, axis)
 
-# @jaxtyped(typechecker=typechecker)
-@partial(jax.jit, static_argnames=["indices", "axis"])
+# Not ``jax.jit``-wrapped: it calls ``custom_roll``, which must trace inline so
+# the active sharding context is honoured (see ``custom_roll``).
 def _stencil_add(
     input_array: jnp.ndarray,
     indices: Tuple[int, ...],

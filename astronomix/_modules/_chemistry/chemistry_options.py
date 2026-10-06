@@ -22,6 +22,9 @@ import jax.numpy as jnp
 KVAERNO5 = 1
 DOPRI5 = 2
 TSIT5 = 3
+# Neural emulator of the per-cell operator (species, T, dt) -> (species, T); see
+# ``_chemistry._emulate_single_cell`` and ``setup_helpers.attach_emulator``.
+EMULATOR = 4
 
 
 class ChemistryConfig(NamedTuple):
@@ -44,6 +47,15 @@ class ChemistryConfig(NamedTuple):
             rate-modifier vectors).
         solver: Stiff-solver tag (see the module-level constants).
         max_steps: Maximum internal Diffrax steps per cell per hydro step.
+        reaction_chunk_size: When positive and smaller than the number of grid
+            cells, react the grid in sequential chunks of this many cells
+            (``jax.lax.map`` with this ``batch_size``) instead of a single
+            ``vmap`` over the whole grid. Each chunk is still vmapped internally,
+            so throughput is preserved once a chunk saturates the device, but the
+            stiff-solver working set is bounded to one chunk rather than the whole
+            grid. The per-cell solves are independent, so the result is identical
+            to the unchunked path; this only bounds peak memory. Zero (the
+            default) reacts the whole grid at once (original behaviour).
         thermochemistry: When True, the temperature is evolved together with the
             abundances (heating/cooling feedback) and written back into the
             pressure field. When False the species react at a fixed temperature
@@ -69,6 +81,7 @@ class ChemistryConfig(NamedTuple):
     number_of_reactions: int = 0
     solver: int = KVAERNO5
     max_steps: int = 4096
+    reaction_chunk_size: int = 0
 
     # thermochemistry (chemistry-driven heating/cooling of the energy field)
     thermochemistry: bool = False
@@ -81,6 +94,88 @@ class ChemistryConfig(NamedTuple):
     ionized_carbon_index: int = -1
     co_cooling: bool = False
     carbon_monoxide_index: int = -1
+    # Chemistry sub-cycling: react only once the hydro time accumulated since the
+    # last reaction reaches this many code time units (and at the end of every
+    # integration call), so the per-cell operator takes one long step instead of
+    # several short ones. 0 = react every hydro step (Lie-Trotter as before). The
+    # accumulated dt is what the operator (stiff solve or emulator) is asked to
+    # advance; the species are advected by the hydro in between as usual. Meant
+    # for the emulator, whose rollout error grows with the number of calls rather
+    # than with the elapsed time, and to give a fine-CFL run the chemistry step of
+    # a coarser one (e.g. 0.1 code units, the validated 160^3 dt_max, at 256^3).
+    chemistry_step_target: float = 0.0
+    # Density gate for the sub-cycling: cells at or above this hydrogen nuclei
+    # density [cm^-3] react EVERY hydro step with the hydro dt (their cooling time
+    # is short and the hydro cannot take a long chemistry step: at 256^3 a 2-3 step
+    # chemistry step drove hundreds of dense cells non-finite), while the cells
+    # below it react on the accumulated clock. 0 = no gate (every cell on the clock).
+    chemistry_subcycle_density_threshold_cgs: float = 0.0
+    # Temperature gate (with the density gate): cells at or above this temperature
+    # [K] are treated like the dense cells - they react every hydro step, and in
+    # the stiff-core hybrid they are re-solved by the stiff network. Motivation
+    # (2026-09-29): behind the collision shock the void gas is heated to 1e3-1e4 K
+    # and must cool within a hydro step; on the accumulated clock the emulator
+    # under-cools it and the shocked void settles at ~2000 K instead of ~450 K.
+    # 0 = off.
+    chemistry_subcycle_temperature_threshold_kelvin: float = 0.0
+    # With the density gate, apply the reaction in this many passes of dt/n per
+    # call (Lie splitting of the chemistry step itself). Lets the diffuse gas take
+    # an accumulated step longer than the emulator's training time grid (v3 ends
+    # at 3e11 s = 0.11 code units): e.g. a 0.18 code-unit accumulated step as two
+    # passes of 0.09. Dense cells pay the same n passes of their hydro dt / n.
+    chemistry_call_splits: int = 1
+    # --- neural emulator (solver == EMULATOR) ---
+    # "fcnn": one dense network on [state, tau, log10 nH] (CODES FullyConnected).
+    # "multionet": a branch net on [state, log10 nH] and a trunk net on [tau] whose
+    # outputs are split per quantity and dotted (CODES MultiONet).
+    emulator_architecture: str = "fcnn"
+    emulator_activation: str = "softplus"
+    emulator_residual: bool = True
+    # After the emulator step, rescale the H-bearing species to the cell's
+    # hydrogen-nuclei budget and reset electrons to charge neutrality.
+    emulator_project_conservation: bool = True
+    # Guards against off-manifold runaway (an emulator is unbounded where it was
+    # not trained): clip standardised inputs to +-this many sigma, and cap the
+    # per-step change of log10 species fractions and of log10 T (dex; 0 = off).
+    # Species are bounded by the per-element projection (a species can never
+    # exceed its element's budget), so the species cap is off by default; the
+    # stiff solve itself moves species by up to ~6 dex and T by up to ~2.6 dex in
+    # one hydro step in hot dense gas, so the T cap only stops the absurd.
+    emulator_input_clip_sigma: float = 5.0
+    emulator_max_log_change: float = 0.0
+    emulator_max_log_temperature_change: float = 3.0
+    # Training-domain guard: a cell whose log10 n_H or log10 T lies more than this
+    # many dex outside the range the emulator was trained on (emulator_domain_* in
+    # the params, written by the exporter from the training set) is left unchanged
+    # instead of being extrapolated. Negative = guard off.
+    emulator_domain_margin_dex: float = 0.1
+    # --- second emulator for the dense gas (emulator_dense_threshold_cgs > 0) ---
+    # Cells at or above this hydrogen-nuclei density [cm^-3] are advanced by the
+    # "dense" emulator leaves (emulator_dense_* in the params, see
+    # ``attach_emulator(dense_emulator_npz_path=...)``) instead of the main ones.
+    # Both nets are evaluated for every cell and the result selected per cell, so
+    # the emulator costs two forward passes. Meant to pair a short-time-grid model
+    # that resolves a single hydro step in the cores (where the chemistry reacts
+    # every step) with a long-grid model for the gated diffuse gas: a model trained
+    # on a 1e13 s grid freezes at an 8e10 s call, one trained to 3e11 s cannot take
+    # the 1e12 s diffuse step (CONTEXT.md 2026-09-22). 0 = one emulator everywhere.
+    emulator_dense_threshold_cgs: float = 0.0
+    emulator_dense_architecture: str = "fcnn"
+    emulator_dense_activation: str = "softplus"
+    emulator_dense_residual: bool = True
+    # Stiff-core hybrid (solver == EMULATOR with the density gate): the cells at or
+    # above chemistry_subcycle_density_threshold_cgs are advanced by the STIFF
+    # network solve instead of the emulator, up to this many cells per device per
+    # call (a fixed capacity keeps the gather/scatter jit-able; cells beyond it keep
+    # the emulator result). The cores are ~0.5% of a 256^3 grid, so exact core
+    # chemistry costs a small fraction of the full stiff run. 0 = off.
+    stiff_core_capacity: int = 0
+    # With the stiff-core hybrid: also re-solve the cells OUTSIDE the emulator's
+    # training domain (which the domain guard would otherwise freeze) with the
+    # stiff network. 2026-09-29: the density-floor / shocked void carries 10-35% of
+    # the density hydrogen in its species, i.e. species n_H ~ 0.3-1 cm^-3, below the
+    # pool of every emulator; frozen, it never cools behind the collision shock.
+    stiff_outside_domain: bool = False
 
 
 class ChemistryParams(NamedTuple):
@@ -144,6 +239,14 @@ class ChemistryParams(NamedTuple):
     # H + H -> H2 grain formation rate coefficient [cm^3 s^-1] (formation heating)
     hydrogen_molecule_formation_rate_coefficient: float = 3e-17
 
+    # Cooling limiter: the maximum fractional change in temperature the
+    # operator-split thermochemistry may apply to a cell in one hydro step
+    # (``|dT|/T <= cooling_courant``). Bounds the pressure change the fixed-grid
+    # hydro sees per step, stabilising the coupling to stiff radiative cooling
+    # while keeping the timestep at the fast hydro CFL. A cell needing more
+    # cooling converges over the next few steps.
+    cooling_courant: float = 0.3
+
     # stiff-solver tolerances
     atol: float = 1e-18
     rtol: float = 1e-10
@@ -155,3 +258,40 @@ class ChemistryParams(NamedTuple):
     # tabulated CO rotational cooling (Neufeld & Kaufman 1993)
     co_cooling_table: jnp.ndarray = jnp.array([])
     co_cooling_bounds: jnp.ndarray = jnp.array([])
+    # --- neural emulator leaves (solver == EMULATOR); filled by attach_emulator ---
+    # Dense layers W_i (out, in) and b_i, applied as act(W h + b); the last layer is linear.
+    # For the "fcnn" architecture this is the whole network; for "multionet" it is the
+    # branch net and the trunk net rides in the two leaves below.
+    emulator_weights: Tuple[jnp.ndarray, ...] = ()
+    emulator_biases: Tuple[jnp.ndarray, ...] = ()
+    emulator_trunk_weights: Tuple[jnp.ndarray, ...] = ()
+    emulator_trunk_biases: Tuple[jnp.ndarray, ...] = ()
+    # Standardisation of the 17 quantities [log10 x_i (species), log10 T] and of log10 nH.
+    emulator_input_mean: jnp.ndarray = jnp.array([])
+    emulator_input_std: jnp.ndarray = jnp.array([])
+    emulator_param_mean: float = 0.0
+    emulator_param_std: float = 1.0
+    # The time grid [s] (t=0 + saved times) whose index fraction is the model's time input.
+    emulator_time_grid: jnp.ndarray = jnp.array([])
+    # Hydrogen atoms and charge per species (for the conservation projection).
+    emulator_hydrogen_atoms: jnp.ndarray = jnp.array([])
+    emulator_charges: jnp.ndarray = jnp.array([])
+    # Atoms of each element per species, shape (species, elements); every element is
+    # conserved per cell by rescaling its species after the emulator step.
+    emulator_element_matrix: jnp.ndarray = jnp.array([])
+    # [min, max] of log10 n_H and log10 T in the training set (empty = unknown, guard off).
+    emulator_domain_log_nh: jnp.ndarray = jnp.array([])
+    emulator_domain_log_t: jnp.ndarray = jnp.array([])
+    # Leaves of the optional dense-gas emulator (ChemistryConfig.emulator_dense_threshold_cgs
+    # > 0); same layout as the main leaves above. Activation and residual flag are shared.
+    emulator_dense_weights: Tuple[jnp.ndarray, ...] = ()
+    emulator_dense_biases: Tuple[jnp.ndarray, ...] = ()
+    emulator_dense_trunk_weights: Tuple[jnp.ndarray, ...] = ()
+    emulator_dense_trunk_biases: Tuple[jnp.ndarray, ...] = ()
+    emulator_dense_input_mean: jnp.ndarray = jnp.array([])
+    emulator_dense_input_std: jnp.ndarray = jnp.array([])
+    emulator_dense_param_mean: float = 0.0
+    emulator_dense_param_std: float = 1.0
+    emulator_dense_time_grid: jnp.ndarray = jnp.array([])
+    emulator_dense_domain_log_nh: jnp.ndarray = jnp.array([])
+    emulator_dense_domain_log_t: jnp.ndarray = jnp.array([])

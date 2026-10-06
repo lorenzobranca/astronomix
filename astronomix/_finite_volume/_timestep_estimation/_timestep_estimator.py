@@ -92,10 +92,45 @@ def get_wave_speeds(
         c_L = speed_of_sound_crs(primitives_left, registered_variables)
         c_R = speed_of_sound_crs(primitives_right, registered_variables)
 
+    # For MHD, the fastest signal is the fast magnetosonic speed, not the sound
+    # speed. Using only ``c`` here underestimates the wave speed and hence
+    # overestimates the timestep, so the split scheme's post-magnetic-update gas
+    # half-step overshoots and goes unstable in magnetically-dominated (low-beta)
+    # cells. Bound ``c`` by the fast speed sqrt(c^2 + v_A^2) with v_A^2 = |B|^2/rho
+    # (code units: magnetic pressure is |B|^2/2, so v_A = |B|/sqrt(rho)).
+    if config.mhd:
+        magnetic = registered_variables.magnetic_index
+        b_squared_left = (
+            primitives_left[magnetic.x] ** 2
+            + primitives_left[magnetic.y] ** 2
+            + primitives_left[magnetic.z] ** 2
+        )
+        b_squared_right = (
+            primitives_right[magnetic.x] ** 2
+            + primitives_right[magnetic.y] ** 2
+            + primitives_right[magnetic.z] ** 2
+        )
+        c_L = jnp.sqrt(c_L**2 + b_squared_left / rho_L)
+        c_R = jnp.sqrt(c_R**2 + b_squared_right / rho_R)
+
     # A simple symmetric estimate of the maximum signal speed on either side of
     # the interface; the |u| + c form is sufficient for the time-step bound.
     wave_speeds_right_plus = jnp.abs(u_L) + c_L
     wave_speeds_left_minus = jnp.abs(u_R) + c_R
+
+    # nan-safe reduction: a single cell with a non-finite or non-positive
+    # pressure/density (which the sqrt above turns into nan) must not poison the
+    # GLOBAL maximum -- ``jnp.max`` propagates nan, the timestep becomes nan, and
+    # the next evolve then takes every cell in the grid non-finite at once, so
+    # the per-cell nan backstop ends up flooring the whole domain. Drop such
+    # cells from the reduction (they are repaired by the backstop after the
+    # evolve); the remaining finite cells still bound the timestep.
+    wave_speeds_right_plus = jnp.where(
+        jnp.isfinite(wave_speeds_right_plus), wave_speeds_right_plus, 0.0
+    )
+    wave_speeds_left_minus = jnp.where(
+        jnp.isfinite(wave_speeds_left_minus), wave_speeds_left_minus, 0.0
+    )
 
     max_wave_speed = jnp.maximum(
         jnp.max(jnp.abs(wave_speeds_right_plus)),
@@ -144,85 +179,44 @@ def _cfl_time_step(
         dt = C_CFL * 1 / jnp.sum(alpha_lax / grid_spacing)
 
     else:
+        # ``get_wave_speeds`` returns ``max(|u| + c)`` over the cells it is given.
+        # The original code paired each cell with its neighbour via the
+        # ``[:-1]`` / ``[1:]`` slices, but the maximum over all interface pairs is
+        # just the maximum over all cells (each cell is both a left and a right
+        # state). Passing the state as both arguments therefore yields the
+        # identical maximum without any neighbour slice/roll, so the timestep
+        # estimate is a pure reduction that shards cleanly under SPMD (a width
+        # ``N-1`` slice of a sharded axis cannot be lowered).
         if config.dimensionality == 3:
-            # wave speeds in x direction
-            primitive_state_left = primitive_state[:, :-1, :, :]
-            primitive_state_right = primitive_state[:, 1:, :, :]
             max_wave_speed_x = get_wave_speeds(
-                primitive_state_left,
-                primitive_state_right,
-                gamma,
-                registered_variables,
-                config,
-                registered_variables.velocity_index.x,
+                primitive_state, primitive_state, gamma,
+                registered_variables, config, registered_variables.velocity_index.x,
             )
-
-            # wave speeds in y direction
-            primitive_state_left = primitive_state[:, :, :-1, :]
-            primitive_state_right = primitive_state[:, :, 1:, :]
             max_wave_speed_y = get_wave_speeds(
-                primitive_state_left,
-                primitive_state_right,
-                gamma,
-                registered_variables,
-                config,
-                registered_variables.velocity_index.y,
+                primitive_state, primitive_state, gamma,
+                registered_variables, config, registered_variables.velocity_index.y,
             )
-
-            # wave speeds in z direction
-            primitive_state_left = primitive_state[:, :, :, :-1]
-            primitive_state_right = primitive_state[:, :, :, 1:]
             max_wave_speed_z = get_wave_speeds(
-                primitive_state_left,
-                primitive_state_right,
-                gamma,
-                registered_variables,
-                config,
-                registered_variables.velocity_index.z,
+                primitive_state, primitive_state, gamma,
+                registered_variables, config, registered_variables.velocity_index.z,
             )
-
-            # get the maximum wave speed
             max_wave_speed = jnp.maximum(
                 jnp.maximum(max_wave_speed_x, max_wave_speed_y), max_wave_speed_z
             )
         elif config.dimensionality == 2:
-            # wave speeds in x direction
-            primitive_state_left = primitive_state[:, :-1, :]
-            primitive_state_right = primitive_state[:, 1:, :]
             max_wave_speed_x = get_wave_speeds(
-                primitive_state_left,
-                primitive_state_right,
-                gamma,
-                registered_variables,
-                config,
-                registered_variables.velocity_index.x,
+                primitive_state, primitive_state, gamma,
+                registered_variables, config, registered_variables.velocity_index.x,
             )
-
-            # wave speeds in y direction
-            primitive_state_left = primitive_state[:, :, :-1]
-            primitive_state_right = primitive_state[:, :, 1:]
             max_wave_speed_y = get_wave_speeds(
-                primitive_state_left,
-                primitive_state_right,
-                gamma,
-                registered_variables,
-                config,
-                registered_variables.velocity_index.y,
+                primitive_state, primitive_state, gamma,
+                registered_variables, config, registered_variables.velocity_index.y,
             )
-
-            # get the maximum wave speed
             max_wave_speed = jnp.maximum(max_wave_speed_x, max_wave_speed_y)
         else:
-            # wave speeds in x direction
-            primitive_state_left = primitive_state[:, :-1]
-            primitive_state_right = primitive_state[:, 1:]
             max_wave_speed = get_wave_speeds(
-                primitive_state_left,
-                primitive_state_right,
-                gamma,
-                registered_variables,
-                config,
-                registered_variables.velocity_index,
+                primitive_state, primitive_state, gamma,
+                registered_variables, config, registered_variables.velocity_index,
             )
 
         # calculate the time step
@@ -230,6 +224,11 @@ def _cfl_time_step(
 
         if config.use_max_adaptive_timestep:
             dt = jnp.minimum(dt, dt_max)
+
+        # Final guard: never hand a non-finite or non-positive step to the
+        # evolve (a nan dt is a global catastrophe, see ``get_wave_speeds``).
+        # ``dt_max`` is the natural finite fallback for the split scheme.
+        dt = jnp.where(jnp.isfinite(dt) & (dt > 0.0), dt, dt_max)
 
     # viscous time step constraint
     if config.diffusion:
